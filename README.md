@@ -146,10 +146,10 @@ The system prompt describes these limits so the model can plan around them.
 ## Tests
 
 ```bash
-uv run python test_spike.py
+uv run pytest
 ```
 
-Runs three test groups with 13 subtests: bridge unit tests, end-to-end agent test with scripted fake LLM, middleware surface test (tools registered, system prompt injected, backend required, type-checking defaults). No API keys needed.
+Runs three test groups with 14 subtests: bridge unit tests, end-to-end agent test with scripted fake LLM, middleware surface test (tools registered, system prompt injected, backend required, type-checking defaults). No API keys needed.
 
 ## Credits
 
