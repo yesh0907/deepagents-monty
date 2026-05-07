@@ -49,6 +49,66 @@ sorted(sizes, key=lambda x: -x[1])
 
 — and the files it sees are the same files a subsequent `read_file` call would see.
 
+## External functions
+
+You can also expose host Python functions to Monty code. This is useful when the sandbox
+needs a carefully scoped capability that Monty does not provide directly, such as robust
+CSV parsing, an API client, or a domain-specific helper.
+
+```python
+from typing import Any
+
+from deepagents import create_deep_agent
+from deepagents.backends import StateBackend
+from deepagents_monty import MontyCodeMiddleware
+
+
+def read_csv(path: str) -> list[dict[str, Any]]:
+    ...
+
+
+backend = StateBackend()
+agent = create_deep_agent(
+    model="anthropic:claude-sonnet-4-6",
+    backend=backend,
+    middleware=[
+        MontyCodeMiddleware(
+            backend=backend,
+            external_functions={"read_csv": read_csv},
+            type_check_stubs="""
+from typing import Any
+
+def read_csv(path: str) -> list[dict[str, Any]]:
+    \"\"\"Read a CSV file and return one dictionary per row.\"\"\"
+    ...
+""",
+        )
+    ],
+)
+```
+
+The model can then call the function from `execute_python`:
+
+```python
+rows = read_csv("/transactions.csv")
+sum(row["Amount"] for row in rows if row["Category"] == "Groceries")
+```
+
+Async external functions are supported by Monty's async runtime, but sandbox code must call
+them with `await`:
+
+```python
+data = await fetch_json("https://example.com/data.json")
+```
+
+External functions are resolved as otherwise-undefined global names. They do not override
+Monty builtins, imports, or names defined inside the executed code.
+
+Prefer JSON-like return values (`str`, `int`, `float`, `bool`, `None`, `list`, `dict`) for
+the most stable model-facing API. Monty can support richer Python values in some cases, but
+those are easier for the model to misuse unless they are accurately described in
+`type_check_stubs`.
+
 ## How it works
 
 Three pieces:
@@ -57,7 +117,7 @@ Three pieces:
 
 2. **`MontyCodeMiddleware(AgentMiddleware)`** — wraps the bridge up as a proper middleware. Registers the `execute_python` tool, injects a system prompt describing its capabilities and limits, accepts `backend` and a few knobs in its constructor.
 
-3. **`execute_python` tool** — the LLM-facing surface. Accepts Python code as a string, runs it in Monty with the backend-bridged filesystem, returns the last expression and captured stdout.
+3. **`execute_python` tool** — the LLM-facing surface. Accepts Python code as a string, runs it in Monty with the backend-bridged filesystem and optional external functions, returns the last expression and captured stdout.
 
 ## Design decisions
 
@@ -108,7 +168,7 @@ Calling `asyncio.run_coroutine_threadsafe(coro, main_loop)` from inside a `path_
 
 A dedicated-loop-thread workaround does exist and does unblock — the bridge can run async coroutines on a separate asyncio loop on its own daemon thread, so Monty's worker blocks on *that* thread while the main loop stays responsive. But empirically it pays a consistent **~3.8s first-call warmup cost** (PyO3/tokio cross-thread initialization) that isn't worth paying. Subsequent calls are fast (~50ms each). Throughout, the main loop does stay responsive, so it's a latency problem, not a correctness problem — but it's still slow enough to be painful, and it's not the idiomatic Monty pattern.
 
-**The idiomatic alternative is to write a complementary middleware that uses `external_functions`**:
+**The idiomatic alternative is to expose async helpers through `external_functions`**:
 
 ```python
 external_functions = {
@@ -119,9 +179,7 @@ external_functions = {
 }
 ```
 
-The LLM-facing ergonomics change — `await read_file('/x')` instead of `Path('/x').read_text()` — but async works natively with zero thread-bridging and no PyO3 Future pinning issues. This is also the approach Pydantic AI's own `CodeExecutionToolset` took (see their PR [pydantic-ai#4153](https://github.com/pydantic/pydantic-ai/pull/4153)).
-
-This middleware stays sync-only. If you need async-remote, build the external_functions variant alongside it.
+The LLM-facing ergonomics change — `await read_file('/x')` instead of `Path('/x').read_text()` — but async works natively with zero thread-bridging and no PyO3 Future pinning issues. `MontyCodeMiddleware` supports this through its `external_functions` argument, while keeping the `pathlib.Path` filesystem bridge sync-only. This is also the approach Pydantic AI's own `CodeExecutionToolset` took (see their PR [pydantic-ai#4153](https://github.com/pydantic/pydantic-ai/pull/4153)).
 
 ## Threading note
 

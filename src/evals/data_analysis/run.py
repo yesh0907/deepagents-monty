@@ -31,6 +31,7 @@ from pydantic import SecretStr
 from deepagents_monty import MontyCodeMiddleware
 
 from .cases import AGENT_DATASET_PATH, CSV_PATH, EVAL_CASES, SQLITE_PATH, EvalCase
+from .read_csv_external import READ_CSV_TYPE_STUBS, make_read_csv
 
 DEFAULT_MODEL = "gpt-5.4-mini"
 DEFAULT_BASE_URL = "https://opencode.ai/zen/v1"
@@ -202,8 +203,24 @@ def dataset_files() -> dict[str, Any]:
     return {AGENT_DATASET_PATH: create_file_data(CSV_PATH.read_text())}
 
 
-def make_agent(*, model: ChatOpenAI, backend: StateBackend, with_monty: bool):
-    middleware = [MontyCodeMiddleware(backend=backend)] if with_monty else []
+def make_agent(
+    *,
+    model: ChatOpenAI,
+    backend: StateBackend,
+    with_monty: bool,
+    with_read_csv: bool = False,
+):
+    middleware = []
+    if with_monty:
+        external_functions = {"read_csv": make_read_csv(backend)} if with_read_csv else None
+        type_check_stubs = READ_CSV_TYPE_STUBS if with_read_csv else None
+        middleware.append(
+            MontyCodeMiddleware(
+                backend=backend,
+                external_functions=external_functions,
+                type_check_stubs=type_check_stubs,
+            )
+        )
     return create_deep_agent(
         model=model,
         system_prompt=SYSTEM_PROMPT,
@@ -264,6 +281,17 @@ async def run_suite(
             ),
             backend=StateBackend(),
             with_monty=True,
+        ),
+        "monty_read_csv": make_agent(
+            model=make_model(
+                model=model_name,
+                api_key=api_key,
+                base_url=base_url,
+                name="monty-read-csv-agent",
+            ),
+            backend=StateBackend(),
+            with_monty=True,
+            with_read_csv=True,
         ),
     }
     thread_ids = {name: f"data-analysis-evals-{name}" for name in agents}
