@@ -1,1 +1,2 @@
 - use the langsmith cli to fetch data from langsmith
+- download traces from langsmith into the .langsmith directory at the root of the repo (create the directory if it doesn't exist)
