@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
+from deepagents.backends.protocol import BackendProtocol, FileData, ReadResult
 from deepagents.backends.utils import create_file_data
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage
@@ -17,6 +18,21 @@ from deepagents_monty import MontyCodeMiddleware
 from evals.data_analysis.cases import AGENT_DATASET_PATH, CSV_PATH, EVAL_CASES
 from evals.data_analysis.external_functions import TYPE_STUBS, make_read_csv
 from evals.data_analysis.run import expected_answer
+
+
+class FailingSecondPageBackend:
+    def read(self, path: str, offset: int = 0, limit: int = 2000) -> ReadResult:  # noqa: ARG002
+        if offset == 0:
+            return ReadResult(
+                file_data=cast(
+                    FileData,
+                    {
+                        "content": "Date,Amount\n"
+                        + "\n".join("2024-01-01,1" for _ in range(limit - 1))
+                    },
+                )
+            )
+        return ReadResult(error="backend unavailable")
 
 
 class ToolCapableFakeModel(FakeMessagesListChatModel):
@@ -92,3 +108,10 @@ async def test_read_csv_external_function_analyzes_seeded_transactions(read_csv_
     expected = expected_answer(EVAL_CASES[0])
     assert expected == "120.47"
     assert f"return: '{expected}'" in _tool_result(result["messages"], "read-csv")
+
+
+def test_read_csv_external_function_propagates_later_page_errors():
+    read_csv = make_read_csv(cast(BackendProtocol, FailingSecondPageBackend()))
+
+    with pytest.raises(OSError, match="line offset 2000"):
+        read_csv("/transactions.csv")

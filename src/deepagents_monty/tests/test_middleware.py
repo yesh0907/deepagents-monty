@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 from typing import Any, cast
 
 import pytest
@@ -118,6 +119,29 @@ async def test_external_async_function_available_to_monty_with_await():
     result = await tool.coroutine(code="await fetch_value(41)", runtime=None)
 
     assert result == "return: 42"
+
+
+async def test_external_async_function_runs_in_captured_context():
+    value_var = contextvars.ContextVar("value", default="missing")
+
+    async def read_context() -> str:
+        return value_var.get()
+
+    token = value_var.set("captured")
+    try:
+        mw = MontyCodeMiddleware(
+            backend=StateBackend(),
+            external_functions={"read_context": read_context},
+            type_check_stubs="async def read_context() -> str: ...",
+        )
+        tool = cast(StructuredTool, mw.tools[0])
+        assert tool.coroutine is not None
+
+        result = await tool.coroutine(code="await read_context()", runtime=None)
+    finally:
+        value_var.reset(token)
+
+    assert result == "return: 'captured'"
 
 
 async def test_type_check_stubs_describe_external_functions():

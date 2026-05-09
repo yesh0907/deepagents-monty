@@ -19,10 +19,14 @@ def make_read_csv(backend: BackendProtocol) -> Callable[[str], list[dict[str, An
         limit = 2000
         while True:
             result = backend.read(path, offset=offset, limit=limit)
-            if result.error or not result.file_data:
+            if result.error:
+                if offset == 0:
+                    raise FileNotFoundError(path) from None
+                raise OSError(f"failed to read {path} at line offset {offset}: {result.error}")
+            if not result.file_data:
                 if offset == 0:
                     raise FileNotFoundError(path)
-                break
+                raise OSError(f"failed to read {path} at line offset {offset}: no file data")
 
             content_chunk = result.file_data.get("content", "")
             if not content_chunk:

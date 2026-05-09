@@ -12,6 +12,7 @@ See README.md for the design discussion. The short version:
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import inspect
 from collections.abc import Callable
@@ -271,7 +272,8 @@ def _wrap_external_functions_in_context(
         if inspect.iscoroutinefunction(fn):
 
             async def async_wrapper(*args: Any, __fn: Callable[..., Any] = fn, **kwargs: Any) -> Any:
-                return await ctx.run(__fn, *args, **kwargs)
+                task = ctx.run(lambda: asyncio.create_task(__fn(*args, **kwargs)))
+                return await task
 
             wrapped[name] = async_wrapper
         else:
