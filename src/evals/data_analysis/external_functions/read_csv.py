@@ -9,18 +9,6 @@ from typing import Any
 
 from deepagents.backends.protocol import BackendProtocol
 
-READ_CSV_TYPE_STUBS = """\
-from typing import Any
-
-def read_csv(path: str) -> list[dict[str, Any]]:
-    \"\"\"Read a CSV file from the agent filesystem.
-
-    Returns one dictionary per row. Transaction Amount values are floats;
-    other transaction columns are strings.
-    \"\"\"
-    ...
-"""
-
 
 def make_read_csv(backend: BackendProtocol) -> Callable[[str], list[dict[str, Any]]]:
     """Create a Monty external function that reads CSV from a Deep Agents backend."""

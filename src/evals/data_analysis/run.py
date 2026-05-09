@@ -5,14 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
@@ -26,15 +25,18 @@ from dotenv import load_dotenv
 from langchain.agents.middleware import TodoListMiddleware
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
-from pydantic import SecretStr
 
 from deepagents_monty import MontyCodeMiddleware
+from evals.data_analysis.cases import (
+    AGENT_DATASET_PATH,
+    CSV_PATH,
+    EVAL_CASES,
+    SQLITE_PATH,
+    EvalCase,
+)
+from evals.data_analysis.external_functions import TYPE_STUBS, make_read_csv
 
-from .cases import AGENT_DATASET_PATH, CSV_PATH, EVAL_CASES, SQLITE_PATH, EvalCase
-from .read_csv_external import READ_CSV_TYPE_STUBS, make_read_csv
-
-DEFAULT_MODEL = "gpt-5.4-mini"
-DEFAULT_BASE_URL = "https://opencode.ai/zen/v1"
+DEFAULT_MODEL = "gpt-5.4"
 SYSTEM_PROMPT = """You are evaluating personal-finance data analysis.
 Your transaction data is available in the virtual filesystem at /transactions.csv.
 Answer the user's question exactly and concisely.
@@ -98,14 +100,10 @@ def normalize_answer(value: str) -> str:
 def grade_answer(actual: str, expected: str, tolerance: float) -> bool:
     actual_norm = normalize_answer(actual)
     expected_norm = normalize_answer(expected)
-    if tolerance > 0:
-        actual_number = _first_number(actual_norm)
-        expected_number = _first_number(expected_norm)
-        return (
-            actual_number is not None
-            and expected_number is not None
-            and abs(actual_number - expected_number) <= tolerance
-        )
+    actual_number = _first_number(actual_norm)
+    expected_number = _first_number(expected_norm)
+    if actual_number is not None and expected_number is not None:
+        return abs(actual_number - expected_number) <= tolerance
     return actual_norm == expected_norm
 
 
@@ -169,15 +167,20 @@ def _extract_text_from_content_block(block: Any, *, prefer_final_answer: bool) -
     return text
 
 
-def make_model(*, model: str, api_key: str, base_url: str, name: str = "agent") -> ChatOpenAI:
+def make_model(
+    *,
+    model: str,
+    base_url: str | None = None,
+    reasoning_effort: Literal["minimal", "low", "medium", "high"] = "low",
+    name: str = "agent",
+) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
-        api_key=SecretStr(api_key),
         base_url=base_url,
-        temperature=0,
+        reasoning_effort=reasoning_effort,
         use_responses_api=True,
         output_version="responses/v1",
-        max_retries=1,
+        max_retries=3,
         name=name,
     )
 
@@ -192,13 +195,6 @@ def configure_eval_harness_profile(model_name: str) -> None:
     )
 
 
-def require_api_key() -> str:
-    value = os.environ.get("OPENCODE_API_KEY")
-    if not value:
-        raise SystemExit("Set OPENCODE_API_KEY in .env before running evals.")
-    return value
-
-
 def dataset_files() -> dict[str, Any]:
     return {AGENT_DATASET_PATH: create_file_data(CSV_PATH.read_text())}
 
@@ -208,17 +204,14 @@ def make_agent(
     model: ChatOpenAI,
     backend: StateBackend,
     with_monty: bool,
-    with_read_csv: bool = False,
 ):
     middleware = []
     if with_monty:
-        external_functions = {"read_csv": make_read_csv(backend)} if with_read_csv else None
-        type_check_stubs = READ_CSV_TYPE_STUBS if with_read_csv else None
         middleware.append(
             MontyCodeMiddleware(
                 backend=backend,
-                external_functions=external_functions,
-                type_check_stubs=type_check_stubs,
+                external_functions={"read_csv": make_read_csv(backend)},
+                type_check_stubs=TYPE_STUBS,
             )
         )
     return create_deep_agent(
@@ -260,9 +253,7 @@ async def run_case(agent: Any, case: EvalCase, expected: str, *, thread_id: str)
     }
 
 
-async def run_suite(
-    *, model_name: str, api_key: str, base_url: str, logger: EvalLogger
-) -> dict[str, Any]:
+async def run_suite(*, model_name: str, base_url: str | None, logger: EvalLogger) -> dict[str, Any]:
     logger.log(f"Creating model {model_name} with base URL {base_url}")
     logger.log("Disabling default subagent and planning middleware")
     configure_eval_harness_profile(model_name)
@@ -270,36 +261,23 @@ async def run_suite(
     agents = {
         "no_python": make_agent(
             model=make_model(
-                model=model_name, api_key=api_key, base_url=base_url, name="basic-agent"
+                model=model_name,
+                base_url=base_url,
+                name="basic-agent",
             ),
             backend=StateBackend(),
             with_monty=False,
         ),
         "monty": make_agent(
             model=make_model(
-                model=model_name, api_key=api_key, base_url=base_url, name="monty-agent"
-            ),
-            backend=StateBackend(),
-            with_monty=True,
-        ),
-        "monty_read_csv": make_agent(
-            model=make_model(
                 model=model_name,
-                api_key=api_key,
                 base_url=base_url,
-                name="monty-read-csv-agent",
+                name="monty-agent",
             ),
             backend=StateBackend(),
             with_monty=True,
-            with_read_csv=True,
         ),
     }
-    thread_ids = {name: f"data-analysis-evals-{name}" for name in agents}
-
-    for agent_name, agent in agents.items():
-        logger.log(f"Seeding StateBackend filesystem for {agent_name}")
-        await seed_agent_filesystem(agent, thread_id=thread_ids[agent_name])
-
     logger.log(f"Running {len(EVAL_CASES)} cases across {len(agents)} agent variants")
     results: dict[str, list[dict[str, Any]]] = {name: [] for name in agents}
     for case_index, case in enumerate(EVAL_CASES, start=1):
@@ -309,8 +287,11 @@ async def run_suite(
         logger.log(f"Question: {case.question}")
         logger.log(f"Expected: {expected}")
         for agent_name, agent in agents.items():
+            thread_id = f"data-analysis-evals-{agent_name}-{case.id}"
+            logger.log(f"{agent_name}: seeding StateBackend filesystem in thread {thread_id}")
+            await seed_agent_filesystem(agent, thread_id=thread_id)
             logger.log(f"{agent_name}: running")
-            result = await run_case(agent, case, expected, thread_id=thread_ids[agent_name])
+            result = await run_case(agent, case, expected, thread_id=thread_id)
             results[agent_name].append(result)
             status = "PASS" if result["passed"] else "FAIL"
             logger.log(f"{agent_name}: {status}")
@@ -358,11 +339,8 @@ def write_report(report: dict[str, Any], output: Path | None) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=os.environ.get("OPENCODE_ZEN_MODEL", DEFAULT_MODEL))
-    parser.add_argument(
-        "--base-url", default=os.environ.get("OPENCODE_ZEN_BASE_URL", DEFAULT_BASE_URL)
-    )
-    parser.add_argument("--api-key", default=require_api_key())
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--base-url", default=None)
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args(argv)
 
@@ -378,7 +356,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     report = asyncio.run(
         run_suite(
             model_name=args.model,
-            api_key=args.api_key,
             base_url=args.base_url,
             logger=logger,
         )

@@ -15,7 +15,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from deepagents_monty import MontyCodeMiddleware
 from evals.data_analysis.cases import AGENT_DATASET_PATH, CSV_PATH, EVAL_CASES
-from evals.data_analysis.read_csv_external import READ_CSV_TYPE_STUBS, make_read_csv
+from evals.data_analysis.external_functions import TYPE_STUBS, make_read_csv
 from evals.data_analysis.run import expected_answer
 
 
@@ -69,7 +69,7 @@ def read_csv_agent():
             MontyCodeMiddleware(
                 backend=backend,
                 external_functions={"read_csv": make_read_csv(backend)},
-                type_check_stubs=READ_CSV_TYPE_STUBS,
+                type_check_stubs=TYPE_STUBS,
             )
         ],
         subagents=(),
