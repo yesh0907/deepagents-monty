@@ -57,8 +57,8 @@ class DeepAgentBackendOS(AbstractOS):
     first-call PyO3/tokio warmup cost, and it's not the canonical
     Monty pattern.
 
-    The idiomatic alternative is a complementary middleware that exposes
-    the backend as ``external_functions``::
+    The idiomatic alternative is to expose those host operations through
+    ``MontyCodeMiddleware(external_functions=...)``::
 
         external_functions = {
             "read_file":  async def read_file(path): ...,

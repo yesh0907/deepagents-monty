@@ -46,7 +46,7 @@ EVAL_CASES: tuple[EvalCase, ...] = (
         sql=(
             "select category from transactions "
             "where amount > 0 "
-            "and category not in ('Income', 'Credit Card Payment', 'Internal Transfers') "
+            "and category not in ('Income', 'Credit Card Payment', 'Internal Transfers', 'Savings Transfer') "
             "group by category order by sum(amount) desc limit 1"
         ),
         answer_template="{value}",
@@ -112,7 +112,7 @@ EVAL_CASES: tuple[EvalCase, ...] = (
         question=(
             "What's the biggest single charge anywhere in my transactions? Just give me the amount."
         ),
-        sql="select round(max(amount), 2) from transactions where amount > 0",
+        sql="select round(max(amount), 2) from transactions where amount > 0 and category not in ('Internal Transfers', 'Savings Transfer')",
         answer_template="{value:.2f}",
     ),
 )

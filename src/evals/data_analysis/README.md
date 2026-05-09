@@ -2,7 +2,7 @@
 
 This suite compares a standard Deep Agent with file tools only against the same agent plus `MontyCodeMiddleware`.
 
-The runner seeds `transactions.csv` into each agent's `StateBackend` filesystem once before the eval cases run, so the agents see the dataset at `/transactions.csv` without receiving file contents in each user prompt. Expected answers are computed deterministically from `dataset/transactions.sqlite`.
+For each case and agent variant, the runner creates an isolated `StateBackend` thread and seeds `transactions.csv` into that thread before invocation. The agents see the dataset at `/transactions.csv` without receiving file contents in each user prompt. Expected answers are computed deterministically from `dataset/transactions.sqlite`.
 
 ## Setup
 

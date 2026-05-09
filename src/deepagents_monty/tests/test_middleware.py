@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 from typing import Any, cast
 
 import pytest
@@ -84,3 +85,112 @@ async def test_type_check_can_be_disabled():
     assert tool.coroutine is not None
     result = await tool.coroutine(code='x: int = "not an int"\nx', runtime=None)
     assert "return:" in result, f"expected the expression to evaluate, got: {result}"
+
+
+async def test_external_sync_function_available_to_monty():
+    def double(value: int) -> int:
+        return value * 2
+
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"double": double},
+        type_check_stubs="def double(value: int) -> int: ...",
+    )
+    tool = cast(StructuredTool, mw.tools[0])
+    assert tool.coroutine is not None
+
+    result = await tool.coroutine(code="double(21)", runtime=None)
+
+    assert result == "return: 42"
+
+
+async def test_external_async_function_available_to_monty_with_await():
+    async def fetch_value(value: int) -> int:
+        return value + 1
+
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"fetch_value": fetch_value},
+        type_check_stubs="async def fetch_value(value: int) -> int: ...",
+    )
+    tool = cast(StructuredTool, mw.tools[0])
+    assert tool.coroutine is not None
+
+    result = await tool.coroutine(code="await fetch_value(41)", runtime=None)
+
+    assert result == "return: 42"
+
+
+async def test_external_async_function_runs_in_captured_context():
+    value_var = contextvars.ContextVar("value", default="missing")
+
+    async def read_context() -> str:
+        return value_var.get()
+
+    token = value_var.set("captured")
+    try:
+        mw = MontyCodeMiddleware(
+            backend=StateBackend(),
+            external_functions={"read_context": read_context},
+            type_check_stubs="async def read_context() -> str: ...",
+        )
+        tool = cast(StructuredTool, mw.tools[0])
+        assert tool.coroutine is not None
+
+        result = await tool.coroutine(code="await read_context()", runtime=None)
+    finally:
+        value_var.reset(token)
+
+    assert result == "return: 'captured'"
+
+
+async def test_type_check_stubs_describe_external_functions():
+    def typed_add(left: int, right: int) -> int:
+        return left + right
+
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"typed_add": typed_add},
+        type_check_stubs="def typed_add(left: int, right: int) -> int: ...",
+    )
+    tool = cast(StructuredTool, mw.tools[0])
+    assert tool.coroutine is not None
+
+    result = await tool.coroutine(code='typed_add("x", 1)', runtime=None)
+
+    assert result.startswith("TypeError:")
+
+
+def test_external_function_stubs_are_appended_to_system_prompt():
+    stubs = "async def fetch_value(value: int) -> int: ..."
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"fetch_value": lambda value: value},
+        type_check_stubs=stubs,
+    )
+    captured: dict = {}
+
+    def handler(req):
+        captured["system"] = req.system_message
+        return "ok"
+
+    req = _FakeRequest(SystemMessage(content="You are helpful."))
+    mw.wrap_model_call(cast(ModelRequest[Any], req), handler)
+
+    text = _combine_text(captured["system"])
+    assert stubs in text
+    assert "Call async functions with `await`" in text
+
+
+async def test_external_functions_do_not_override_builtins():
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"len": lambda value: 99},
+        type_check=False,
+    )
+    tool = cast(StructuredTool, mw.tools[0])
+    assert tool.coroutine is not None
+
+    result = await tool.coroutine(code="len([1, 2, 3])", runtime=None)
+
+    assert result == "return: 3"
