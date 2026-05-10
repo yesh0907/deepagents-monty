@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -30,9 +31,9 @@ def _combine_text(sm: SystemMessage) -> str:
     return " ".join(b.get("text", "") for b in sm.content_blocks if b.get("type") == "text")
 
 
-def test_registers_execute_python_tool():
+def test_registers_python_repl_tool():
     mw = MontyCodeMiddleware(backend=StateBackend())
-    assert [t.name for t in mw.tools] == ["execute_python"]
+    assert [t.name for t in mw.tools] == ["python_repl"]
 
 
 def test_tool_schema_hides_runtime():
@@ -40,7 +41,8 @@ def test_tool_schema_hides_runtime():
     mw = MontyCodeMiddleware(backend=StateBackend())
     schema = convert_to_openai_tool(mw.tools[0])
     props = schema["function"]["parameters"]["properties"]
-    assert set(props.keys()) == {"code"}
+    assert set(props.keys()) == {"code", "restart"}
+    assert "reset REPL state" in props["restart"]["description"]
 
 
 def test_system_prompt_appended_preserves_original():
@@ -57,7 +59,7 @@ def test_system_prompt_appended_preserves_original():
     text = _combine_text(captured["system"])
     assert "You are helpful." in text, "original system prompt dropped"
     for phrase in (
-        "execute_python",
+        "python_repl",
         "pathlib.Path",
         "read_file",
         "third-party libraries",
@@ -85,6 +87,28 @@ async def test_type_check_can_be_disabled():
     assert tool.coroutine is not None
     result = await tool.coroutine(code='x: int = "not an int"\nx', runtime=None)
     assert "return:" in result, f"expected the expression to evaluate, got: {result}"
+
+
+async def test_python_repl_rejects_parallel_tool_call_batch():
+    mw = MontyCodeMiddleware(backend=StateBackend())
+    tool = cast(StructuredTool, mw.tools[0])
+    assert tool.coroutine is not None
+    runtime = SimpleNamespace(
+        state={
+            "messages": [
+                SimpleNamespace(
+                    tool_calls=[
+                        {"name": "python_repl", "args": {"code": "1 + 1"}, "id": "a"},
+                        {"name": "read_file", "args": {"file_path": "/x"}, "id": "b"},
+                    ]
+                )
+            ]
+        }
+    )
+
+    result = await tool.coroutine(code="1 + 1", runtime=runtime)
+
+    assert result.startswith("RuntimeError: python_repl cannot run in parallel")
 
 
 async def test_external_sync_function_available_to_monty():
@@ -161,6 +185,22 @@ async def test_type_check_stubs_describe_external_functions():
     assert result.startswith("TypeError:")
 
 
+async def test_external_function_signatures_are_auto_stubbed_for_type_checking():
+    def typed_add(left: int, right: int) -> int:
+        return left + right
+
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"typed_add": typed_add},
+    )
+    tool = cast(StructuredTool, mw.tools[0])
+    assert tool.coroutine is not None
+
+    result = await tool.coroutine(code='typed_add("x", 1)', runtime=None)
+
+    assert result.startswith("TypeError:")
+
+
 def test_external_function_stubs_are_appended_to_system_prompt():
     stubs = "async def fetch_value(value: int) -> int: ..."
     mw = MontyCodeMiddleware(
@@ -180,6 +220,56 @@ def test_external_function_stubs_are_appended_to_system_prompt():
     text = _combine_text(captured["system"])
     assert stubs in text
     assert "Call async functions with `await`" in text
+
+
+def test_external_function_signatures_are_auto_appended_to_system_prompt():
+    async def fetch_value(value: int) -> int:
+        return value + 1
+
+    def double(value: int) -> int:
+        return value * 2
+
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"fetch_value": fetch_value, "double": double},
+    )
+    captured: dict = {}
+
+    def handler(req):
+        captured["system"] = req.system_message
+        return "ok"
+
+    req = _FakeRequest(SystemMessage(content="You are helpful."))
+    mw.wrap_model_call(cast(ModelRequest[Any], req), handler)
+
+    text = _combine_text(captured["system"])
+    assert "do not redefine or import them" in text
+    assert "Async functions (`async def`) must be called with `await`" in text
+    assert "Sync functions (`def`) are called normally" in text
+    assert "async def fetch_value(value: int) -> int: ..." in text
+    assert "def double(value: int) -> int: ..." in text
+
+
+def test_external_function_prompt_tailors_async_only_guidance():
+    async def fetch_value(value: int) -> int:
+        return value + 1
+
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"fetch_value": fetch_value},
+    )
+    captured: dict = {}
+
+    def handler(req):
+        captured["system"] = req.system_message
+        return "ok"
+
+    req = _FakeRequest(SystemMessage(content="You are helpful."))
+    mw.wrap_model_call(cast(ModelRequest[Any], req), handler)
+
+    text = _combine_text(captured["system"])
+    assert "All external functions are async" in text
+    assert "Calling without `await` returns an unresolved future" in text
 
 
 async def test_external_functions_do_not_override_builtins():

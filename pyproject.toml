@@ -1,7 +1,7 @@
 [project]
 name = "deepagents-monty"
 version = "0.1.0"
-description = "Monty-backed execute_python middleware for Deep Agents, with a shared filesystem between the sandbox and the agent's file tools."
+description = "Monty-backed Python REPL middleware for Deep Agents, with a shared filesystem between the sandbox and the agent's file tools."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -30,7 +30,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "pydantic-monty>=0.0.11",
+    "pydantic-monty>=0.0.17",
     "deepagents>=0.5.3",
     "langchain>=1.0.0",
     "langchain-core>=1.0.0",

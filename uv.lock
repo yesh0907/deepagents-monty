@@ -334,7 +334,7 @@ requires-dist = [
     { name = "langchain-core", specifier = ">=1.0.0" },
     { name = "langchain-openai", specifier = ">=0.3.26" },
     { name = "langgraph", specifier = ">=1.0.0" },
-    { name = "pydantic-monty", specifier = ">=0.0.11" },
+    { name = "pydantic-monty", specifier = ">=0.0.17" },
     { name = "python-dotenv", specifier = ">=1.0" },
 ]
 

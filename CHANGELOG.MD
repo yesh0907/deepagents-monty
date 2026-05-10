@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AbstractOS`, bridging pathlib operations inside Monty code to backend reads
   and writes.
 - `MontyCodeMiddleware` - a Deep Agents `AgentMiddleware` that registers an
-  `execute_python` tool backed by Monty and injects a descriptive system prompt.
+  `python_repl` tool backed by Monty and injects a descriptive system prompt.
 - `make_execute_python` - standalone tool factory for advanced users who want
   the tool without the middleware machinery.
 
