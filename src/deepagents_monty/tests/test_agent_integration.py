@@ -1,6 +1,6 @@
 """End-to-end tests with a real Deep Agent and a scripted fake LLM.
 
-Proves that ``execute_python`` and the stock filesystem tools share one
+Proves that ``python_repl`` and the stock filesystem tools share one
 filesystem when wired through ``create_deep_agent`` with the same backend.
 """
 
@@ -41,7 +41,7 @@ def scripted_agent():
             content="",
             tool_calls=[
                 {
-                    "name": "execute_python",
+                    "name": "python_repl",
                     "args": {
                         "code": (
                             "from pathlib import Path\n"
@@ -83,7 +83,7 @@ def scripted_agent():
             content="",
             tool_calls=[
                 {
-                    "name": "execute_python",
+                    "name": "python_repl",
                     "args": {
                         "code": ("from pathlib import Path\nPath('/agent_wrote.txt').read_text()")
                     },
@@ -118,3 +118,82 @@ async def test_write_file_visible_to_monty(scripted_agent):
 
     assert "Updated file /agent_wrote.txt" in tool_results["c3"]
     assert "hello from write_file tool" in tool_results["c4"]
+
+
+async def test_python_repl_state_persists_across_tool_calls():
+    shared_backend = StateBackend()
+    script: list[BaseMessage] = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "python_repl",
+                    "args": {"code": "counter = 41\ncounter"},
+                    "id": "repl1",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "python_repl",
+                    "args": {"code": "counter + 1"},
+                    "id": "repl2",
+                }
+            ],
+        ),
+        AIMessage(content="All done."),
+    ]
+    fake_model = ToolCapableFakeModel(responses=script)
+    agent = create_deep_agent(
+        model=fake_model,
+        middleware=[MontyCodeMiddleware(backend=shared_backend)],
+        backend=shared_backend,
+    )
+
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": "demo"}]})
+    tool_results = _collect_tool_results(result["messages"])
+
+    assert tool_results["repl1"] == "return: 41"
+    assert tool_results["repl2"] == "return: 42"
+
+
+async def test_python_repl_restart_resets_state():
+    shared_backend = StateBackend()
+    script: list[BaseMessage] = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "python_repl",
+                    "args": {"code": "counter = 41\ncounter"},
+                    "id": "repl1",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "python_repl",
+                    "args": {"code": "counter", "restart": True},
+                    "id": "repl2",
+                }
+            ],
+        ),
+        AIMessage(content="All done."),
+    ]
+    fake_model = ToolCapableFakeModel(responses=script)
+    agent = create_deep_agent(
+        model=fake_model,
+        middleware=[MontyCodeMiddleware(backend=shared_backend, type_check=False)],
+        backend=shared_backend,
+    )
+
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": "demo"}]})
+    tool_results = _collect_tool_results(result["messages"])
+
+    assert tool_results["repl1"] == "return: 41"
+    assert tool_results["repl2"].startswith("RuntimeError:")
+    assert "counter" in tool_results["repl2"]

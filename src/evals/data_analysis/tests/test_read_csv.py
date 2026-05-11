@@ -58,7 +58,7 @@ def read_csv_agent():
             content="",
             tool_calls=[
                 {
-                    "name": "execute_python",
+                    "name": "python_repl",
                     "args": {
                         "code": (
                             "rows = read_csv('/transactions.csv')\n"

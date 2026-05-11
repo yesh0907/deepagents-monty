@@ -1,13 +1,13 @@
 # deepagents-monty
 
-`MontyCodeMiddleware` for [Deep Agents](https://github.com/langchain-ai/deepagents): adds a secure `execute_python` tool backed by Pydantic's [Monty](https://github.com/pydantic/monty) sandboxed Python interpreter, with files shared across Monty and the rest of the agent.
+`MontyCodeMiddleware` for [Deep Agents](https://github.com/langchain-ai/deepagents): adds a secure `python_repl` tool backed by Pydantic's [Monty](https://github.com/pydantic/monty) sandboxed Python interpreter, with files shared across Monty and the rest of the agent.
 
 When the LLM writes Python code, the code runs in a microsecond-startup sandbox with zero host capabilities except what you explicitly grant. It can read and write files through `pathlib.Path`, and those files are the **same** files that `read_file`, `write_file`, `ls`, `glob`, `grep`, and `edit_file` see.
 
 ## Install
 
 ```bash
-uv add 'deepagents>=0.5.3' 'pydantic-monty>=0.0.11'
+uv add 'deepagents>=0.5.3' 'pydantic-monty>=0.0.17'
 ```
 
 ## Usage
@@ -33,7 +33,7 @@ result = await agent.ainvoke({
 })
 ```
 
-The model can now call `execute_python` with code like:
+The model can now call `python_repl` with code like:
 
 ```python
 from pathlib import Path
@@ -49,11 +49,19 @@ sorted(sizes, key=lambda x: -x[1])
 
 — and the files it sees are the same files a subsequent `read_file` call would see.
 
+`python_repl` preserves state between calls. The model can set `restart=true` to reset
+the REPL before running a snippet.
+
 ## External functions
 
 You can also expose host Python functions to Monty code. This is useful when the sandbox
 needs a carefully scoped capability that Monty does not provide directly, such as robust
 CSV parsing, an API client, or a domain-specific helper.
+
+Function signatures are derived automatically from Python annotations and added to the
+model prompt and Monty type checker. You can still pass `type_check_stubs` to override
+or enrich the generated stubs when the public sandbox contract should differ from the
+host function signature.
 
 ```python
 from typing import Any
@@ -87,7 +95,7 @@ def read_csv(path: str) -> list[dict[str, Any]]:
 )
 ```
 
-The model can then call the function from `execute_python`:
+The model can then call the function from `python_repl`:
 
 ```python
 rows = read_csv("/transactions.csv")
@@ -115,21 +123,29 @@ Three pieces:
 
 1. **`DeepAgentBackendOS(AbstractOS)`** — projects a Deep Agents `BackendProtocol` as a Monty virtual filesystem. Monty's VM calls `path_read_bytes`, `path_write_text`, etc.; we route those to `backend.read`, `backend.write`, etc.
 
-2. **`MontyCodeMiddleware(AgentMiddleware)`** — wraps the bridge up as a proper middleware. Registers the `execute_python` tool, injects a system prompt describing its capabilities and limits, accepts `backend` and a few knobs in its constructor.
+2. **`MontyCodeMiddleware(AgentMiddleware)`** — wraps the bridge up as a proper middleware. Registers the `python_repl` tool, injects a system prompt describing its capabilities and limits, accepts `backend` and a few knobs in its constructor.
 
-3. **`execute_python` tool** — the LLM-facing surface. Accepts Python code as a string, runs it in Monty with the backend-bridged filesystem and optional external functions, returns the last expression and captured stdout.
+3. **`python_repl` tool** — the LLM-facing surface. Accepts Python code as a string plus an optional `restart` flag, runs it in Monty with the backend-bridged filesystem and optional external functions, returns the last expression and captured stdout.
 
 ## Design decisions
 
 ### `backend` is required (no silent default)
 
-`FilesystemMiddleware` defaults to `StateBackend()` because it's the *provider* of file tools. `MontyCodeMiddleware` is a *consumer* of the shared filesystem — if it silently created its own backend, `execute_python` would be writing to a different filesystem than `read_file` reads from, and the whole point of the middleware is defeated without warning.
+`FilesystemMiddleware` defaults to `StateBackend()` because it's the *provider* of file tools. `MontyCodeMiddleware` is a *consumer* of the shared filesystem — if it silently created its own backend, `python_repl` would be writing to a different filesystem than `read_file` reads from, and the whole point of the middleware is defeated without warning.
 
 Matches the pattern of `SkillsMiddleware` and `MemoryMiddleware`, which also require a backend.
 
 ### Type checking defaults to on
 
 `type_check=True` by default. Monty uses `ty` (the same type checker Astral ships with Ruff) at parse time. Costs ~15-30ms at parse, zero at runtime, and gives the model a clear diagnostic on type errors before the code starts running so it can retry on the same turn. Matches Pydantic AI's own code-mode default. Opt out with `MontyCodeMiddleware(backend=..., type_check=False)`.
+
+### `python_repl` rejects parallel tool calls
+
+The `python_repl` tool is intentionally ordered: if the model emits it in the same assistant message as another tool call, the tool returns a `RuntimeError` asking the model to call `python_repl` by itself and wait for the result. This keeps REPL state, filesystem effects, and future durable persistence easy to reason about.
+
+### `restart=true` resets REPL state
+
+By default, `python_repl` preserves variables, imports, and function definitions between calls. Passing `restart=true` starts a fresh REPL before executing the snippet. Use this when accumulated state is confusing or no longer relevant.
 
 ### Delete and rename are not supported
 
@@ -191,7 +207,7 @@ You don't need to think about this unless you're writing a custom `BackendProtoc
 
 ## Monty's limitations (pass-through)
 
-`MontyCodeMiddleware` inherits Monty's subset of Python. Current limits in `pydantic-monty` 0.0.15:
+`MontyCodeMiddleware` inherits Monty's subset of Python. Current limits in `pydantic-monty` 0.0.17:
 
 - **No class definitions.** LLM-generated code will hit a `SyntaxError` if it writes `class Foo: ...`.
 - **No match statements, no generators, no context managers.**
@@ -207,7 +223,7 @@ The system prompt describes these limits so the model can plan around them.
 uv run pytest
 ```
 
-Runs three test groups with 14 subtests: bridge unit tests, end-to-end agent test with scripted fake LLM, middleware surface test (tools registered, system prompt injected, backend required, type-checking defaults). No API keys needed.
+Runs three test groups with 21 tests: bridge unit tests, end-to-end agent tests with scripted fake LLMs, and middleware surface tests (tools registered, system prompt injected, backend required, type-checking defaults, parallel-call rejection). No API keys needed.
 
 ## Credits
 

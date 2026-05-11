@@ -1,5 +1,5 @@
 """MontyCodeMiddleware: a Deep Agents middleware that adds a Monty-backed
-``execute_python`` tool sharing the agent's filesystem.
+``python_repl`` tool sharing the agent's filesystem.
 
 See README.md for the design discussion. The short version:
 
@@ -13,51 +13,75 @@ See README.md for the design discussion. The short version:
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import inspect
 from collections.abc import Callable
-from typing import Any
+from types import UnionType
+from typing import Annotated, Any
 
 import pydantic_monty as pm
 from deepagents.backends.protocol import BackendProtocol
 from langchain.agents.middleware import AgentMiddleware, ModelRequest
-from langchain_core.messages import SystemMessage
+from langchain.agents.middleware.types import OmitFromSchema
+from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.prebuilt.tool_node import ToolRuntime
-from pydantic_monty import Monty, ResourceLimits
+from langgraph.types import Command
+from pydantic import Field
+from pydantic_monty import MontyRepl, ResourceLimits
+from typing_extensions import TypedDict
 
 from .bridge import DeepAgentBackendOS
 
 __all__ = ["MontyCodeMiddleware", "make_execute_python"]
 
+_REPL_STATE_KEY = "monty_repl_state_b64"
+
+
+class MontyCodeState(TypedDict, total=False):
+    monty_repl_state_b64: Annotated[str, OmitFromSchema()]
+
 
 EXECUTE_PYTHON_DESCRIPTION = """\
-Run Python in a secure Monty interpreter.
+Write and run Python code in a secure Monty-backed REPL sandbox.
 
 Files: read/write via pathlib.Path. Paths must be absolute (start with /).
 These files are the SAME ones ls/read_file/write_file/edit_file see.
+
+State is preserved between calls (REPL-style). Set restart=true to reset
+the REPL state before running the snippet.
 
 Limitations:
 - Subset of Python only: no classes, no match statements, no generators,
   no context managers (yet).
 - No third-party libraries (pandas, requests, etc.).
+- Importable standard library modules: sys, typing, asyncio, math, json, re,
+  datetime, os, pathlib. Import them at the top of your snippet before use.
+- No wall-clock or timing primitives: asyncio.sleep, datetime.datetime.now(),
+  datetime.date.today(), and the time module are unavailable.
+- No import * wildcard imports.
+- Do not call in parallel with other tools. Run one python_repl call at a time.
 - Files cannot be deleted or renamed - overwrite with empty content instead.
 - Directories are implicit (they exist only when they contain files).
 
-The return value is the last expression evaluated. Use print() for debugging;
-stdout/stderr are captured and returned.
+The last expression's value is captured as the return value. Do not print()
+return values; use print() only for supplementary logging or debugging.
 """
 
 
 _MONTY_SYSTEM_PROMPT = """\
-## Code execution (`execute_python`)
+## Code execution (`python_repl`)
 
-You have access to `execute_python` for running Python code in a secure \
-sandboxed interpreter. This is the right tool when a task is easier to \
+You have access to `python_repl` for writing and running Python code in a \
+secure Monty-backed REPL sandbox. This is the right tool when a task is easier to \
 express as code than as a sequence of filesystem tool calls - loops, \
 conditionals, data transforms, JSON parsing, etc.
 
-Filesystem sharing: code run via `execute_python` reads and writes files \
+State is preserved between calls (REPL-style). Set `restart=true` to reset \
+the REPL state before running a snippet.
+
+Filesystem sharing: code run via `python_repl` reads and writes files \
 through `pathlib.Path`, and sees the SAME filesystem as `ls`, `read_file`, \
 `write_file`, `edit_file`, `glob`, and `grep`. Paths must be absolute \
 (start with `/`).
@@ -66,12 +90,21 @@ Limitations to be aware of:
 - This is a Python subset: no class definitions, no match statements, no \
 context managers (yet).
 - No third-party libraries (pandas, requests, numpy, etc.). Only core \
-syntax and a small stdlib subset (`sys`, `typing`, `asyncio`, `re`, \
-`datetime`, `json`).
+syntax and a small stdlib subset (`sys`, `typing`, `asyncio`, `math`, \
+`json`, `re`, `datetime`, `os`, `pathlib`). Import modules at the top of \
+your snippet before use.
+- No wall-clock or timing primitives: `asyncio.sleep`, \
+`datetime.datetime.now()`, `datetime.date.today()`, and the `time` module \
+are unavailable.
+- No `import *` wildcard imports.
 - Files cannot be deleted or renamed. To "delete", overwrite with empty \
 content. Directories are implicit - they exist only when they contain files.
-- Use `print()` for debugging; stdout is captured and returned.
-- The last top-level expression is the return value.
+- Do not call `python_repl` in parallel with other tools. It is an ordered \
+REPL-style execution surface, so run one snippet at a time and wait for the \
+tool result before deciding the next tool call.
+- The last top-level expression is captured as the return value. Do not \
+`print()` return values; use `print()` only for supplementary logging or \
+debugging.
 """
 
 
@@ -97,61 +130,162 @@ def make_execute_python(
     max_duration_secs: float = 10.0,
     type_check: bool = True,
 ) -> StructuredTool:
-    """Build a standalone ``execute_python`` tool.
+    """Build a standalone ``python_repl`` tool.
 
     Most users should prefer :class:`MontyCodeMiddleware`, which also handles
     system-prompt injection. This helper is for advanced setups that want to
     register the tool manually (e.g. alongside custom middleware composition).
     """
+    effective_type_check_stubs = _resolve_type_check_stubs(
+        external_functions=external_functions,
+        type_check_stubs=type_check_stubs,
+    )
 
-    async def execute_python(code: str, runtime: ToolRuntime) -> str:
+    async def execute_python(
+        code: Annotated[str, Field(description="The Python code to execute in the sandbox.")],
+        runtime: ToolRuntime,
+        restart: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set to true to reset REPL state before running this snippet. "
+                    "When false (default), state is preserved between calls."
+                )
+            ),
+        ] = False,
+    ) -> str | Command:
+        if parallel_error := _parallel_tool_call_error(runtime):
+            return parallel_error
+
         fs = DeepAgentBackendOS(backend)
         wrapped_external_functions = _wrap_external_functions_in_context(external_functions)
-        try:
-            m = Monty(code, type_check=type_check, type_check_stubs=type_check_stubs)
-        except pm.MontySyntaxError as e:
-            return f"SyntaxError: {e}"
-        except pm.MontyTypingError as e:
-            return f"TypeError: {e}"
-
         stdout_chunks: list[str] = []
 
         def capture_print(stream: str, text: str) -> None:
             stdout_chunks.append(text)
 
         try:
-            result = await m.run_async(
+            repl = _load_repl(
+                runtime,
+                limits=ResourceLimits(max_duration_secs=max_duration_secs),
+                type_check=type_check,
+                type_check_stubs=effective_type_check_stubs,
+                restart=restart,
+            )
+        except pm.MontySyntaxError as e:
+            return f"SyntaxError: {e}"
+        except pm.MontyTypingError as e:
+            return f"TypeError: {e}"
+        except (ValueError, TypeError) as e:
+            return f"MontyError: {type(e).__name__}: {e}"
+
+        try:
+            result = await repl.feed_run_async(
+                code,
                 os=fs,
                 external_functions=wrapped_external_functions,
-                limits=ResourceLimits(max_duration_secs=max_duration_secs),
                 print_callback=capture_print,
             )
+            content = _format_result(result, stdout_chunks)
         except pm.MontyRuntimeError as e:
             stdout = "".join(stdout_chunks)
             tail = f"\n--stdout--\n{stdout}" if stdout else ""
-            return f"RuntimeError: {e}{tail}"
+            content = f"RuntimeError: {e}{tail}"
+        except pm.MontySyntaxError as e:
+            content = f"SyntaxError: {e}"
+        except pm.MontyTypingError as e:
+            content = f"TypeError: {e}"
         except pm.MontyError as e:
-            return f"MontyError: {type(e).__name__}: {e}"
+            content = f"MontyError: {type(e).__name__}: {e}"
 
-        stdout = "".join(stdout_chunks)
-        parts = [f"return: {result!r}"]
-        if stdout:
-            parts.append(f"--stdout--\n{stdout}")
-        return "\n".join(parts)
+        return _tool_result(content, repl, runtime)
 
     return StructuredTool.from_function(
         coroutine=execute_python,
-        name="execute_python",
+        name="python_repl",
         description=EXECUTE_PYTHON_DESCRIPTION,
     )
 
 
+def _load_repl(
+    runtime: ToolRuntime | None,
+    *,
+    limits: ResourceLimits,
+    type_check: bool,
+    type_check_stubs: str | None,
+    restart: bool,
+) -> MontyRepl:
+    state_b64 = None if restart else _get_repl_state_b64(runtime)
+    if state_b64 is not None:
+        return MontyRepl.load(base64.b64decode(state_b64.encode("ascii")))
+
+    return MontyRepl(limits=limits, type_check=type_check, type_check_stubs=type_check_stubs)
+
+
+def _get_repl_state_b64(runtime: ToolRuntime | None) -> str | None:
+    state = getattr(runtime, "state", None)
+    if not isinstance(state, dict):
+        return None
+    value = state.get(_REPL_STATE_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def _format_result(result: Any, stdout_chunks: list[str]) -> str:
+    stdout = "".join(stdout_chunks)
+    parts = [f"return: {result!r}"]
+    if stdout:
+        parts.append(f"--stdout--\n{stdout}")
+    return "\n".join(parts)
+
+
+def _tool_result(content: str, repl: MontyRepl, runtime: ToolRuntime | None) -> str | Command:
+    tool_call_id = getattr(runtime, "tool_call_id", None)
+    if not tool_call_id:
+        return content
+
+    state_b64 = base64.b64encode(repl.dump()).decode("ascii")
+    return Command(
+        update={
+            "messages": [ToolMessage(content=content, tool_call_id=tool_call_id)],
+            _REPL_STATE_KEY: state_b64,
+        }
+    )
+
+
+def _parallel_tool_call_error(runtime: ToolRuntime | None) -> str | None:
+    """Return a model-visible error if ``python_repl`` is in a parallel batch."""
+    if runtime is None:
+        return None
+
+    state = getattr(runtime, "state", None)
+    if not isinstance(state, dict):
+        return None
+
+    messages = state.get("messages")
+    if not messages:
+        return None
+
+    last_message = messages[-1]
+    tool_calls = getattr(last_message, "tool_calls", None)
+    if not tool_calls and isinstance(last_message, dict):
+        tool_calls = last_message.get("tool_calls")
+    if not tool_calls or len(tool_calls) <= 1:
+        return None
+
+    return (
+        "RuntimeError: python_repl cannot run in parallel with other tool calls. "
+        "Call python_repl by itself, wait for the result, then make any follow-up tool calls."
+    )
+
+
 class MontyCodeMiddleware(AgentMiddleware):
-    """Adds an ``execute_python`` tool backed by the Monty interpreter.
+    state_schema: type[Any] = MontyCodeState
+
+    """Adds a ``python_repl`` tool backed by the Monty interpreter.
 
     Code executed via this tool shares the filesystem with any other
     BackendProtocol-using middleware (e.g. ``FilesystemMiddleware``): a file
-    written through ``execute_python`` is readable via ``read_file``, and
+    written through ``python_repl`` is readable via ``read_file``, and
     vice versa, as long as both middlewares use the same backend instance.
 
     Typical usage::
@@ -184,7 +318,7 @@ class MontyCodeMiddleware(AgentMiddleware):
             backend: BackendProtocol to share with the rest of the agent.
                 Required - pass the same instance you pass to
                 ``create_deep_agent(backend=...)`` so code executed via
-                ``execute_python`` sees the same files as ``read_file``,
+                ``python_repl`` sees the same files as ``read_file``,
                 ``write_file``, etc. We follow the pattern of
                 ``SkillsMiddleware`` and ``MemoryMiddleware`` (required
                 backend), rather than ``FilesystemMiddleware`` (defaults to
@@ -193,7 +327,7 @@ class MontyCodeMiddleware(AgentMiddleware):
                 to a new backend would create two disjoint filesystems
                 and break cross-tool file sharing without warning.
             system_prompt: Override for the default Monty system prompt
-                that describes ``execute_python`` to the model.
+                that describes ``python_repl`` to the model.
             external_functions: Optional host functions exposed to Monty code
                 as unresolved global names. These do not override Monty
                 builtins, imports, or names defined by the executed code.
@@ -217,16 +351,24 @@ class MontyCodeMiddleware(AgentMiddleware):
         super().__init__()
         self._backend = backend
         base_prompt = system_prompt if system_prompt is not None else _MONTY_SYSTEM_PROMPT
-        self._system_prompt = _build_system_prompt(base_prompt, type_check_stubs)
+        effective_type_check_stubs = _resolve_type_check_stubs(
+            external_functions=external_functions,
+            type_check_stubs=type_check_stubs,
+        )
+        self._system_prompt = _build_system_prompt(
+            base_prompt,
+            effective_type_check_stubs,
+            external_functions=None if type_check_stubs else external_functions,
+        )
         self._external_functions = external_functions
-        self._type_check_stubs = type_check_stubs
+        self._type_check_stubs = effective_type_check_stubs
         self._max_duration_secs = max_duration_secs
         self._type_check = type_check
         self.tools = [
             make_execute_python(
                 backend=backend,
                 external_functions=external_functions,
-                type_check_stubs=type_check_stubs,
+                type_check_stubs=effective_type_check_stubs,
                 max_duration_secs=max_duration_secs,
                 type_check=type_check,
             )
@@ -243,20 +385,170 @@ class MontyCodeMiddleware(AgentMiddleware):
         return await handler(request.override(system_message=new_system_message))
 
 
-def _build_system_prompt(base_prompt: str, type_check_stubs: str | None) -> str:
+def _resolve_type_check_stubs(
+    *,
+    external_functions: dict[str, Callable[..., Any]] | None,
+    type_check_stubs: str | None,
+) -> str | None:
+    if type_check_stubs:
+        return type_check_stubs
+    return _build_external_function_stubs(external_functions)
+
+
+def _build_external_function_stubs(
+    external_functions: dict[str, Callable[..., Any]] | None,
+) -> str | None:
+    if not external_functions:
+        return None
+    external_imports: set[str] = set()
+    stubs = [
+        _build_external_function_stub(name, fn, external_imports)
+        for name, fn in external_functions.items()
+    ]
+    imports = [
+        "from typing import Any, Annotated, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, Union",
+        *[f"import {module}" for module in sorted(external_imports)],
+    ]
+    return "\n".join(imports) + "\n\n" + "\n".join(stubs)
+
+
+def _build_external_function_stub(
+    name: str,
+    fn: Callable[..., Any],
+    external_imports: set[str],
+) -> str:
+    prefix = "async def" if inspect.iscoroutinefunction(fn) else "def"
+    try:
+        signature = inspect.signature(fn, eval_str=True)
+    except (TypeError, ValueError):
+        return f"{prefix} {name}(*args: Any, **kwargs: Any) -> Any: ..."
+
+    params = _format_signature_params(signature, external_imports)
+    return_type = _format_annotation(signature.return_annotation, external_imports)
+    return f"{prefix} {name}({params}) -> {return_type}: ..."
+
+
+def _format_signature_params(
+    signature: inspect.Signature,
+    external_imports: set[str],
+) -> str:
+    params: list[str] = []
+    saw_keyword_only = False
+    positional_only_count = sum(
+        1 for p in signature.parameters.values() if p.kind is inspect.Parameter.POSITIONAL_ONLY
+    )
+    positional_only_seen = 0
+
+    for param in signature.parameters.values():
+        if param.kind is inspect.Parameter.KEYWORD_ONLY and not saw_keyword_only:
+            params.append("*")
+            saw_keyword_only = True
+
+        params.append(_format_signature_param(param, external_imports))
+
+        if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+            positional_only_seen += 1
+            if positional_only_seen == positional_only_count:
+                params.append("/")
+
+    return ", ".join(params)
+
+
+def _format_signature_param(param: inspect.Parameter, external_imports: set[str]) -> str:
+    name = param.name
+    if param.kind is inspect.Parameter.VAR_POSITIONAL:
+        name = f"*{name}"
+    elif param.kind is inspect.Parameter.VAR_KEYWORD:
+        name = f"**{name}"
+
+    text = f"{name}: {_format_annotation(param.annotation, external_imports)}"
+    if param.default is not inspect.Parameter.empty:
+        text += " = ..."
+    return text
+
+
+def _format_annotation(annotation: Any, external_imports: set[str]) -> str:
+    if annotation is inspect.Signature.empty or annotation is inspect.Parameter.empty:
+        return "Any"
+    if isinstance(annotation, str):
+        return annotation
+    _collect_annotation_imports(annotation, external_imports)
+    return inspect.formatannotation(annotation)
+
+
+def _collect_annotation_imports(annotation: Any, external_imports: set[str]) -> None:
+    if annotation in (None, Any):
+        return
+
+    module = getattr(annotation, "__module__", "")
+    if module not in ("", "builtins", "typing", "types"):
+        external_imports.add(module.split(".", 1)[0])
+
+    origin = getattr(annotation, "__origin__", None)
+    if origin is not None:
+        _collect_annotation_imports(origin, external_imports)
+
+    for arg in getattr(annotation, "__args__", ()):
+        if arg is Ellipsis:
+            continue
+        _collect_annotation_imports(arg, external_imports)
+
+    if isinstance(annotation, UnionType):
+        for arg in annotation.__args__:
+            _collect_annotation_imports(arg, external_imports)
+
+
+def _build_system_prompt(
+    base_prompt: str,
+    type_check_stubs: str | None,
+    *,
+    external_functions: dict[str, Callable[..., Any]] | None = None,
+) -> str:
     if not type_check_stubs:
         return base_prompt
+    external_functions_header = _build_external_functions_header(external_functions)
     return f"""{base_prompt}
 
-External functions: the following host-provided functions/types are available \
-inside `execute_python` as global names. Call async functions with `await`; \
-sync functions can be called normally. External functions are resolved only \
-when a name is not a builtin, import, or local definition.
+{external_functions_header}
 
 ```python
 {type_check_stubs.strip()}
 ```
 """
+
+
+def _build_external_functions_header(
+    external_functions: dict[str, Callable[..., Any]] | None,
+) -> str:
+    base = (
+        "External functions: the following host-provided functions/types are available "
+        "inside `python_repl` as global names. Call them directly; do not redefine or "
+        "import them. External functions are resolved only when a name is not a builtin, "
+        "import, or local definition."
+    )
+    if not external_functions:
+        return (
+            f"{base} Call async functions with `await`; sync functions can be called normally."
+        )
+
+    has_async = any(inspect.iscoroutinefunction(fn) for fn in external_functions.values())
+    has_sync = any(not inspect.iscoroutinefunction(fn) for fn in external_functions.values())
+    if has_async and has_sync:
+        return (
+            f"{base} Async functions (`async def`) must be called with `await`, "
+            "e.g. `result = await fetch_value(arg)`. Sync functions (`def`) are called "
+            "normally, e.g. `result = double(arg)`."
+        )
+    if has_async:
+        return (
+            f"{base} All external functions are async: call them with `await`, "
+            "e.g. `result = await fetch_value(arg)`. Calling without `await` returns "
+            "an unresolved future, not the value."
+        )
+    return (
+        f"{base} All external functions are synchronous: call them normally, "
+        "e.g. `result = double(arg)`."
+    )
 
 
 def _wrap_external_functions_in_context(
