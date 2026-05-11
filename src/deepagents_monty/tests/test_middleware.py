@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import contextvars
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Optional, cast
 
 import pytest
 from deepagents.backends import StateBackend
@@ -201,6 +202,23 @@ async def test_external_function_signatures_are_auto_stubbed_for_type_checking()
     assert result.startswith("TypeError:")
 
 
+async def test_external_function_auto_stubs_handle_non_builtin_annotations():
+    def path_name(path: Path) -> str:
+        return str(path)
+
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"path_name": path_name},
+    )
+    tool = cast(StructuredTool, mw.tools[0])
+    assert tool.coroutine is not None
+
+    result = await tool.coroutine(code="path_name('/tmp/example')", runtime=None)
+
+    assert "SyntaxError" not in result
+    assert "MontyError" not in result
+
+
 def test_external_function_stubs_are_appended_to_system_prompt():
     stubs = "async def fetch_value(value: int) -> int: ..."
     mw = MontyCodeMiddleware(
@@ -248,6 +266,31 @@ def test_external_function_signatures_are_auto_appended_to_system_prompt():
     assert "Sync functions (`def`) are called normally" in text
     assert "async def fetch_value(value: int) -> int: ..." in text
     assert "def double(value: int) -> int: ..." in text
+
+
+def test_external_function_auto_stubs_import_annotation_modules():
+    def maybe_path(path: Path | None, fallback: Optional[Path] = None) -> Path:  # noqa: UP045
+        return path or fallback or Path("/")
+
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"maybe_path": maybe_path},
+    )
+    captured: dict = {}
+
+    def handler(req):
+        captured["system"] = req.system_message
+        return "ok"
+
+    req = _FakeRequest(SystemMessage(content="You are helpful."))
+    mw.wrap_model_call(cast(ModelRequest[Any], req), handler)
+
+    text = _combine_text(captured["system"])
+    assert "from typing import" in text
+    assert "Optional" in text
+    assert "import pathlib" in text
+    assert "pathlib.Path" in text
+    assert "<class 'pathlib.Path'>" not in text
 
 
 def test_external_function_prompt_tailors_async_only_guidance():

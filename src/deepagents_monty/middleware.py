@@ -17,6 +17,7 @@ import base64
 import contextvars
 import inspect
 from collections.abc import Callable
+from types import UnionType
 from typing import Annotated, Any
 
 import pydantic_monty as pm
@@ -399,23 +400,38 @@ def _build_external_function_stubs(
 ) -> str | None:
     if not external_functions:
         return None
-    stubs = [_build_external_function_stub(name, fn) for name, fn in external_functions.items()]
-    return "from typing import Any\n\n" + "\n".join(stubs)
+    external_imports: set[str] = set()
+    stubs = [
+        _build_external_function_stub(name, fn, external_imports)
+        for name, fn in external_functions.items()
+    ]
+    imports = [
+        "from typing import Any, Annotated, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, Union",
+        *[f"import {module}" for module in sorted(external_imports)],
+    ]
+    return "\n".join(imports) + "\n\n" + "\n".join(stubs)
 
 
-def _build_external_function_stub(name: str, fn: Callable[..., Any]) -> str:
+def _build_external_function_stub(
+    name: str,
+    fn: Callable[..., Any],
+    external_imports: set[str],
+) -> str:
     prefix = "async def" if inspect.iscoroutinefunction(fn) else "def"
     try:
-        signature = inspect.signature(fn)
+        signature = inspect.signature(fn, eval_str=True)
     except (TypeError, ValueError):
         return f"{prefix} {name}(*args: Any, **kwargs: Any) -> Any: ..."
 
-    params = _format_signature_params(signature)
-    return_type = _format_annotation(signature.return_annotation)
+    params = _format_signature_params(signature, external_imports)
+    return_type = _format_annotation(signature.return_annotation, external_imports)
     return f"{prefix} {name}({params}) -> {return_type}: ..."
 
 
-def _format_signature_params(signature: inspect.Signature) -> str:
+def _format_signature_params(
+    signature: inspect.Signature,
+    external_imports: set[str],
+) -> str:
     params: list[str] = []
     saw_keyword_only = False
     positional_only_count = sum(
@@ -428,7 +444,7 @@ def _format_signature_params(signature: inspect.Signature) -> str:
             params.append("*")
             saw_keyword_only = True
 
-        params.append(_format_signature_param(param))
+        params.append(_format_signature_param(param, external_imports))
 
         if param.kind is inspect.Parameter.POSITIONAL_ONLY:
             positional_only_seen += 1
@@ -438,30 +454,48 @@ def _format_signature_params(signature: inspect.Signature) -> str:
     return ", ".join(params)
 
 
-def _format_signature_param(param: inspect.Parameter) -> str:
+def _format_signature_param(param: inspect.Parameter, external_imports: set[str]) -> str:
     name = param.name
     if param.kind is inspect.Parameter.VAR_POSITIONAL:
         name = f"*{name}"
     elif param.kind is inspect.Parameter.VAR_KEYWORD:
         name = f"**{name}"
 
-    text = f"{name}: {_format_annotation(param.annotation)}"
+    text = f"{name}: {_format_annotation(param.annotation, external_imports)}"
     if param.default is not inspect.Parameter.empty:
         text += " = ..."
     return text
 
 
-def _format_annotation(annotation: Any) -> str:
+def _format_annotation(annotation: Any, external_imports: set[str]) -> str:
     if annotation is inspect.Signature.empty or annotation is inspect.Parameter.empty:
         return "Any"
     if isinstance(annotation, str):
         return annotation
-    if annotation is None:
-        return "None"
-    if getattr(annotation, "__module__", "") == "builtins":
-        return getattr(annotation, "__qualname__", str(annotation))
-    text = str(annotation)
-    return text.replace("typing.", "")
+    _collect_annotation_imports(annotation, external_imports)
+    return inspect.formatannotation(annotation)
+
+
+def _collect_annotation_imports(annotation: Any, external_imports: set[str]) -> None:
+    if annotation in (None, Any):
+        return
+
+    module = getattr(annotation, "__module__", "")
+    if module not in ("", "builtins", "typing", "types"):
+        external_imports.add(module.split(".", 1)[0])
+
+    origin = getattr(annotation, "__origin__", None)
+    if origin is not None:
+        _collect_annotation_imports(origin, external_imports)
+
+    for arg in getattr(annotation, "__args__", ()):
+        if arg is Ellipsis:
+            continue
+        _collect_annotation_imports(arg, external_imports)
+
+    if isinstance(annotation, UnionType):
+        for arg in annotation.__args__:
+            _collect_annotation_imports(arg, external_imports)
 
 
 def _build_system_prompt(
