@@ -23,7 +23,8 @@ from deepagents.profiles import (
 )
 from dotenv import load_dotenv
 from langchain.agents.middleware import TodoListMiddleware
-from langchain_openai import ChatOpenAI
+from langchain.chat_models import init_chat_model
+from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.checkpoint.memory import MemorySaver
 
 from deepagents_monty import MontyCodeMiddleware
@@ -36,9 +37,12 @@ from evals.data_analysis.cases import (
 )
 from evals.data_analysis.external_functions import TYPE_STUBS, make_read_csv
 
-DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_MODEL = "openai:gpt-5.4-mini"
+DEFAULT_REASONING_EFFORT = "low"
+AgentVariant = Literal["all", "no_python", "monty"]
 SYSTEM_PROMPT = """You are evaluating personal-finance data analysis.
 Your transaction data is available in the virtual filesystem at /transactions.csv.
+Transaction data can include purchases, income, payments, transfers, and adjustments; infer which types belong from the user's wording.
 Answer the user's question exactly and concisely.
 If a numeric answer is requested, return only the requested numeric value with no explanation.
 """
@@ -171,23 +175,38 @@ def make_model(
     *,
     model: str,
     base_url: str | None = None,
-    reasoning_effort: Literal["minimal", "low", "medium", "high"] = "low",
+    reasoning_effort: str | None = None,
     name: str = "agent",
-) -> ChatOpenAI:
-    return ChatOpenAI(
-        model=model,
-        base_url=base_url,
-        reasoning_effort=reasoning_effort,
-        use_responses_api=True,
-        output_version="responses/v1",
-        max_retries=3,
-        name=name,
-    )
+) -> BaseChatModel:
+    provider, model_name = parse_model_id(model)
+    kwargs: dict[str, Any] = {"name": name}
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if reasoning_effort is not None:
+        kwargs.update(reasoning_effort_kwargs(provider, reasoning_effort))
+    return init_chat_model(model_name, model_provider=provider, **kwargs)
 
 
-def configure_eval_harness_profile(model_name: str) -> None:
+def parse_model_id(model: str) -> tuple[str | None, str]:
+    if ":" not in model:
+        return None, model
+    provider, model_name = model.split(":", 1)
+    if not provider or not model_name:
+        raise ValueError("Model must be unprefixed or use the format 'provider:model-name'")
+    return provider, model_name
+
+
+def reasoning_effort_kwargs(provider: str | None, value: str) -> dict[str, str]:
+    if provider in {"google_genai", "google_vertexai"}:
+        return {"thinking_level": value}
+    if provider in {"anthropic", "anthropic_bedrock"}:
+        return {"effort": value}
+    return {"reasoning_effort": value}
+
+
+def configure_eval_harness_profile(model_id: str) -> None:
     register_harness_profile(
-        f"openai:{model_name}",
+        model_id,
         HarnessProfile(
             general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
             excluded_middleware=frozenset({TodoListMiddleware}),
@@ -201,7 +220,7 @@ def dataset_files() -> dict[str, Any]:
 
 def make_agent(
     *,
-    model: ChatOpenAI,
+    model: BaseChatModel,
     backend: StateBackend,
     with_monty: bool,
 ):
@@ -253,31 +272,26 @@ async def run_case(agent: Any, case: EvalCase, expected: str, *, thread_id: str)
     }
 
 
-async def run_suite(*, model_name: str, base_url: str | None, logger: EvalLogger) -> dict[str, Any]:
+async def run_suite(
+    *,
+    model_name: str,
+    base_url: str | None,
+    reasoning_effort: str | None,
+    variant: AgentVariant,
+    logger: EvalLogger,
+) -> dict[str, Any]:
     logger.log(f"Creating model {model_name} with base URL {base_url}")
+    if reasoning_effort is not None:
+        logger.log(f"Forwarding reasoning effort: {reasoning_effort}")
     logger.log("Disabling default subagent and planning middleware")
     configure_eval_harness_profile(model_name)
     logger.log("Creating Deep Agents")
-    agents = {
-        "no_python": make_agent(
-            model=make_model(
-                model=model_name,
-                base_url=base_url,
-                name="basic-agent",
-            ),
-            backend=StateBackend(),
-            with_monty=False,
-        ),
-        "monty": make_agent(
-            model=make_model(
-                model=model_name,
-                base_url=base_url,
-                name="monty-agent",
-            ),
-            backend=StateBackend(),
-            with_monty=True,
-        ),
-    }
+    agents = selected_agents(
+        variant=variant,
+        model_name=model_name,
+        base_url=base_url,
+        reasoning_effort=reasoning_effort,
+    )
     logger.log(f"Running {len(EVAL_CASES)} cases across {len(agents)} agent variants")
     results: dict[str, list[dict[str, Any]]] = {name: [] for name in agents}
     for case_index, case in enumerate(EVAL_CASES, start=1):
@@ -320,11 +334,43 @@ async def run_suite(*, model_name: str, base_url: str | None, logger: EvalLogger
         "metadata": {
             "model": model_name,
             "base_url": base_url,
+            "reasoning_effort": reasoning_effort,
+            "variant": variant,
             "dataset_path": str(CSV_PATH),
             "agent_dataset_path": AGENT_DATASET_PATH,
         },
         "summary": summary,
         "results": results,
+    }
+
+
+def selected_agents(
+    *,
+    variant: AgentVariant,
+    model_name: str,
+    base_url: str | None,
+    reasoning_effort: str | None,
+) -> dict[str, Any]:
+    variants: tuple[tuple[str, bool, str], ...]
+    if variant == "all":
+        variants = (("no_python", False, "basic-agent"), ("monty", True, "monty-agent"))
+    elif variant == "no_python":
+        variants = (("no_python", False, "basic-agent"),)
+    else:
+        variants = (("monty", True, "monty-agent"),)
+
+    return {
+        name: make_agent(
+            model=make_model(
+                model=model_name,
+                base_url=base_url,
+                reasoning_effort=reasoning_effort,
+                name=model_name_for_agent,
+            ),
+            backend=StateBackend(),
+            with_monty=with_monty,
+        )
+        for name, with_monty, model_name_for_agent in variants
     }
 
 
@@ -339,10 +385,17 @@ def write_report(report: dict[str, Any], output: Path | None) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
+    parser.add_argument("--reasoning-effort", default=None)
+    parser.add_argument("--variant", choices=("all", "no_python", "monty"), default="all")
     parser.add_argument("--output", type=Path, default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.model is None:
+        args.model = DEFAULT_MODEL
+        if args.reasoning_effort is None:
+            args.reasoning_effort = DEFAULT_REASONING_EFFORT
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -357,6 +410,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         run_suite(
             model_name=args.model,
             base_url=args.base_url,
+            reasoning_effort=args.reasoning_effort,
+            variant=args.variant,
             logger=logger,
         )
     )

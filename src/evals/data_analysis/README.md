@@ -9,15 +9,12 @@ For each case and agent variant, the runner creates an isolated `StateBackend` t
 Create `.env` at the repository root with:
 
 ```bash
-OPENCODE_API_KEY=...
+OPENAI_API_KEY=...
+ANTHROPIC_API_KEY=...
+GOOGLE_API_KEY=...
 ```
 
-Optional overrides:
-
-```bash
-OPENCODE_ZEN_MODEL=gpt-5.4-mini
-OPENCODE_ZEN_BASE_URL=https://opencode.ai/zen/v1
-```
+Only set the keys for providers you plan to run.
 
 ## Run
 
@@ -25,12 +22,42 @@ OPENCODE_ZEN_BASE_URL=https://opencode.ai/zen/v1
 uv run python -m evals.data_analysis.run
 ```
 
+Specify models with LangChain-style provider prefixes:
+
+```bash
+uv run python -m evals.data_analysis.run --model anthropic:claude-sonnet-4-6
+uv run python -m evals.data_analysis.run --model openai:gpt-5.5 --reasoning-effort low
+uv run python -m evals.data_analysis.run --model google_genai:gemini-2.5-pro --reasoning-effort medium
+```
+
+By default the runner evaluates both agent variants. Use `--variant` to run one side only:
+
+```bash
+uv run python -m evals.data_analysis.run --variant all
+uv run python -m evals.data_analysis.run --variant no_python
+uv run python -m evals.data_analysis.run --variant monty
+```
+
+For OpenAI-compatible endpoints, pass a base URL:
+
+```bash
+uv run python -m evals.data_analysis.run \
+  --model openai:qwen3-coder \
+  --base-url http://localhost:1234/v1
+```
+
 The runner prints plain progress logs and saves the same log data under `.eval_runs/data_analysis/<run-id>/run.log`. The default JSON report is written beside it as `.eval_runs/data_analysis/<run-id>/results.json`.
 
 Defaults:
 
-- Model: `gpt-5.4-mini`
-- Base URL: `https://opencode.ai/zen/v1`
+- Model: `openai:gpt-5.4-mini` when `--model` is omitted
+- Base URL: none
+- Reasoning effort: `low` only when `--model` is omitted; otherwise none unless explicitly set
+- Variant: `all`
 - Output: `.eval_runs/data_analysis/<run-id>/results.json`
 
-You can also override with `--model`, `--base-url`, `--api-key`, or `--output`.
+You can also override with `--model`, `--base-url`, `--reasoning-effort`, `--variant`, or `--output`.
+When you provide `--model`, `--reasoning-effort` is forwarded only if explicitly set, so
+custom model runs do not inherit the default OpenAI reasoning setting. The runner maps the
+flag to provider-specific LangChain parameters where needed, such as `thinking_level` for
+Gemini and `effort` for Anthropic.
