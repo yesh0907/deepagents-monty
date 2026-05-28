@@ -527,9 +527,7 @@ def _build_external_functions_header(
         "import, or local definition."
     )
     if not external_functions:
-        return (
-            f"{base} Call async functions with `await`; sync functions can be called normally."
-        )
+        return f"{base} Call async functions with `await`; sync functions can be called normally."
 
     has_async = any(inspect.iscoroutinefunction(fn) for fn in external_functions.values())
     has_sync = any(not inspect.iscoroutinefunction(fn) for fn in external_functions.values())
@@ -563,7 +561,9 @@ def _wrap_external_functions_in_context(
     for name, fn in external_functions.items():
         if inspect.iscoroutinefunction(fn):
 
-            async def async_wrapper(*args: Any, __fn: Callable[..., Any] = fn, **kwargs: Any) -> Any:
+            async def async_wrapper(
+                *args: Any, __fn: Callable[..., Any] = fn, **kwargs: Any
+            ) -> Any:
                 task = ctx.run(lambda: asyncio.create_task(__fn(*args, **kwargs)))
                 return await task
 

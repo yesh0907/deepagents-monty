@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Monty-backed Python REPL middleware for Deep Agents, with a shared filesystem between the sandbox and the agent's file tools."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Yesh Chandiramani" }]
 keywords = [
     "llm",
@@ -20,7 +21,6 @@ keywords = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -34,13 +34,18 @@ dependencies = [
     "deepagents>=0.5.3",
     "langchain>=1.0.0",
     "langchain-core>=1.0.0",
-    "langchain-openai>=0.3.26",
     "langgraph>=1.0.0",
+]
+
+[project.optional-dependencies]
+evals = [
+    "langchain-openai>=0.3.26",
     "python-dotenv>=1.0",
 ]
 
 [dependency-groups]
 dev = [
+    "twine>=6.0",
     "pyright>=1.1.390",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -52,15 +57,16 @@ Repository = "https://github.com/yesh0907/deepagents-monty"
 Issues = "https://github.com/yesh0907/deepagents-monty/issues"
 
 [build-system]
-requires = ["uv_build>=0.9.5,<0.10.0"]
+requires = ["uv_build>=0.11.16,<0.12.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-root = "src"
+module-name = "deepagents_monty"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["src/deepagents_monty/tests"]
+testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.ruff]
