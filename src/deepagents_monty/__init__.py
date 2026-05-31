@@ -15,13 +15,20 @@ Usage::
 """
 
 from .bridge import DeepAgentBackendOS
-from .middleware import MontyCodeMiddleware, make_execute_python
+from .middleware import (
+    MONTY_SYSTEM_PROMPT,
+    MontyCodeMiddleware,
+    build_system_prompt,
+    make_execute_python,
+)
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
+    "MONTY_SYSTEM_PROMPT",
     "DeepAgentBackendOS",
     "MontyCodeMiddleware",
+    "build_system_prompt",
     "make_execute_python",
     "__version__",
 ]

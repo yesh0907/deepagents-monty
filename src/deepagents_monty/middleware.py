@@ -34,7 +34,12 @@ from typing_extensions import TypedDict
 
 from .bridge import DeepAgentBackendOS
 
-__all__ = ["MontyCodeMiddleware", "make_execute_python"]
+__all__ = [
+    "MONTY_SYSTEM_PROMPT",
+    "MontyCodeMiddleware",
+    "build_system_prompt",
+    "make_execute_python",
+]
 
 _REPL_STATE_KEY = "monty_repl_state_b64"
 
@@ -107,6 +112,12 @@ tool result before deciding the next tool call.
 debugging.
 """
 
+# Public alias for the default system prompt. Advanced consumers can import this
+# to introspect or compose against the default prompt without reaching for the
+# private ``_MONTY_SYSTEM_PROMPT`` symbol. The private name is retained for
+# backward compatibility.
+MONTY_SYSTEM_PROMPT = _MONTY_SYSTEM_PROMPT
+
 
 def _append_to_system_message(system_message: SystemMessage | None, text: str) -> SystemMessage:
     """Append text to a system message, preserving any prior content.
@@ -120,6 +131,29 @@ def _append_to_system_message(system_message: SystemMessage | None, text: str) -
         text = f"\n\n{text}"
     new_content.append({"type": "text", "text": text})
     return SystemMessage(content_blocks=new_content)
+
+
+def build_system_prompt(
+    *,
+    system_prompt: str | None = None,
+    append: str | None = None,
+) -> str:
+    """Compose the base ``python_repl`` system prompt.
+
+    The base is ``system_prompt`` if provided, otherwise the default
+    :data:`MONTY_SYSTEM_PROMPT`. If ``append`` is provided, it is added after
+    the base separated by a blank line. ``system_prompt`` and ``append`` compose
+    independently: you can replace the base, append to the default, both, or
+    neither.
+
+    This returns only the human-authored base prompt. ``MontyCodeMiddleware``
+    additionally appends any ``external_functions`` type stubs after this base
+    when building the prompt it injects into the model request.
+    """
+    base = system_prompt if system_prompt is not None else MONTY_SYSTEM_PROMPT
+    if append:
+        return f"{base}\n\n{append}"
+    return base
 
 
 def make_execute_python(
@@ -307,6 +341,7 @@ class MontyCodeMiddleware(AgentMiddleware):
         *,
         backend: BackendProtocol,
         system_prompt: str | None = None,
+        append_system_prompt: str | None = None,
         external_functions: dict[str, Callable[..., Any]] | None = None,
         type_check_stubs: str | None = None,
         max_duration_secs: float = 10.0,
@@ -327,7 +362,20 @@ class MontyCodeMiddleware(AgentMiddleware):
                 to a new backend would create two disjoint filesystems
                 and break cross-tool file sharing without warning.
             system_prompt: Override for the default Monty system prompt
-                that describes ``python_repl`` to the model.
+                that describes ``python_repl`` to the model. When provided, it
+                *replaces* the default :data:`MONTY_SYSTEM_PROMPT` (you lose the
+                built-in mechanics/limitations doc). Use ``append_system_prompt``
+                instead when you only want to add guidance on top of the default.
+            append_system_prompt: Optional extra guidance appended after the
+                base prompt (separated by a blank line). The base is
+                ``system_prompt`` if provided, else the default
+                :data:`MONTY_SYSTEM_PROMPT`. ``system_prompt`` and
+                ``append_system_prompt`` compose independently: append to the
+                default (the common case - e.g. "when to reach for
+                ``python_repl``" guidance), replace the base entirely, or do
+                both. Any ``external_functions`` type stubs are still appended
+                *after* this composed base, exactly as without
+                ``append_system_prompt``.
             external_functions: Optional host functions exposed to Monty code
                 as unresolved global names. These do not override Monty
                 builtins, imports, or names defined by the executed code.
@@ -350,7 +398,10 @@ class MontyCodeMiddleware(AgentMiddleware):
         """
         super().__init__()
         self._backend = backend
-        base_prompt = system_prompt if system_prompt is not None else _MONTY_SYSTEM_PROMPT
+        base_prompt = build_system_prompt(
+            system_prompt=system_prompt,
+            append=append_system_prompt,
+        )
         effective_type_check_stubs = _resolve_type_check_stubs(
             external_functions=external_functions,
             type_check_stubs=type_check_stubs,

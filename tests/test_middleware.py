@@ -14,7 +14,7 @@ from langchain_core.messages import SystemMessage
 from langchain_core.tools import StructuredTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
-from deepagents_monty import MontyCodeMiddleware
+from deepagents_monty import MONTY_SYSTEM_PROMPT, MontyCodeMiddleware
 
 
 class _FakeRequest:
@@ -313,6 +313,82 @@ def test_external_function_prompt_tailors_async_only_guidance():
     text = _combine_text(captured["system"])
     assert "All external functions are async" in text
     assert "Calling without `await` returns an unresolved future" in text
+
+
+def _capture_injected_prompt(mw: MontyCodeMiddleware) -> str:
+    """Run wrap_model_call and return the injected system prompt text."""
+    captured: dict = {}
+
+    def handler(req):
+        captured["system"] = req.system_message
+        return "ok"
+
+    req = _FakeRequest(SystemMessage(content="You are helpful."))
+    mw.wrap_model_call(cast(ModelRequest[Any], req), handler)
+    return _combine_text(captured["system"])
+
+
+def test_monty_system_prompt_is_importable_and_matches_default():
+    """The default prompt is publicly exposed and equals the injected default."""
+    assert isinstance(MONTY_SYSTEM_PROMPT, str)
+    assert "python_repl" in MONTY_SYSTEM_PROMPT
+    assert "third-party libraries" in MONTY_SYSTEM_PROMPT
+
+    mw = MontyCodeMiddleware(backend=StateBackend())
+    text = _capture_injected_prompt(mw)
+    # With no external functions, the injected prompt is exactly the default base.
+    assert MONTY_SYSTEM_PROMPT in text
+
+
+def test_append_system_prompt_appends_to_default():
+    extra = "When a task involves loops or JSON parsing, reach for python_repl."
+    mw = MontyCodeMiddleware(backend=StateBackend(), append_system_prompt=extra)
+
+    text = _capture_injected_prompt(mw)
+
+    # Default mechanics text is still present...
+    for phrase in ("python_repl", "pathlib.Path", "read_file", "third-party libraries"):
+        assert phrase in text, f"default prompt missing: {phrase!r}"
+    # ...and the appended guidance is present too.
+    assert extra in text
+
+
+def test_append_system_prompt_composes_with_custom_system_prompt():
+    custom_base = "CUSTOM BASE PROMPT describing the sandbox."
+    extra = "EXTRA GUIDANCE about when to use it."
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        system_prompt=custom_base,
+        append_system_prompt=extra,
+    )
+
+    text = _capture_injected_prompt(mw)
+
+    assert custom_base in text
+    assert extra in text
+    # The default mechanics doc is replaced by the custom base, so its
+    # distinctive text should be absent.
+    assert "third-party libraries (pandas, requests, numpy, etc.)" not in text
+
+
+def test_append_system_prompt_keeps_external_function_stubs():
+    """append_system_prompt must not break the type-stub path: stubs still append."""
+    stubs = "def typed_add(left: int, right: int) -> int: ..."
+    extra = "Prefer python_repl for arithmetic over many tool calls."
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        external_functions={"typed_add": lambda left, right: left + right},
+        type_check_stubs=stubs,
+        append_system_prompt=extra,
+    )
+
+    text = _capture_injected_prompt(mw)
+
+    # Default base, appended guidance, and the external-function stubs are all present.
+    assert "third-party libraries" in text
+    assert extra in text
+    assert stubs in text
+    assert "do not redefine or import them" in text
 
 
 async def test_external_functions_do_not_override_builtins():
