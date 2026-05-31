@@ -119,15 +119,49 @@ class DeepAgentBackendOS(AbstractOS):
 
     # ---- reads ---------------------------------------------------------
 
+    # Page size for paginated text reads. The backend's ``read`` slices by
+    # LINE (``lines[offset:offset+limit]``), so we walk the file in line
+    # windows and concatenate until a short page signals EOF.
+    _READ_PAGE_LINES = 5000
+
     def path_read_bytes(self, path: PurePosixPath) -> bytes:
-        r = self._call("read", str(path))
-        if r.error:
+        # ``backend.read`` defaults to ``limit=2000`` LINES — a display cap for
+        # the agent's ``read_file`` tool. That default must NOT leak into
+        # ``pathlib`` reads, where ``Path(p).read_text()`` must return the
+        # WHOLE file. ``limit=None`` is not portable (backends compute
+        # ``offset + limit``), so we paginate by line offset and concatenate.
+        #
+        # Slices preserve each line's terminator (``splitlines(keepends=True)``
+        # joined with ``""``), so adjacent windows reconstruct the file exactly.
+        first = self._call("read", str(path), offset=0, limit=self._READ_PAGE_LINES)
+        if first.error:
             raise FileNotFoundError(str(path))
-        fd = r.file_data or {}
-        content, encoding = fd.get("content", ""), fd.get("encoding", "utf-8")
+        fd = first.file_data or {}
+        encoding = fd.get("encoding", "utf-8")
+
+        # Binary (non-text) files are returned whole by the backend regardless
+        # of offset/limit, so there is nothing to paginate.
         if encoding == "base64":
-            return base64.b64decode(content)
-        return content.encode("utf-8")
+            return base64.b64decode(fd.get("content", ""))
+
+        content = fd.get("content", "")
+        parts = [content]
+        # A page that yields fewer lines than requested is the last page. We
+        # count lines the same way the backend slices them
+        # (``splitlines(keepends=True)``) so a missing trailing newline or a
+        # CRLF→LF normalization can't desync the EOF check.
+        offset = self._READ_PAGE_LINES
+        while len(content.splitlines(keepends=True)) >= self._READ_PAGE_LINES:
+            page = self._call("read", str(path), offset=offset, limit=self._READ_PAGE_LINES)
+            if page.error:
+                # Offset past EOF — we've already consumed the whole file.
+                break
+            content = (page.file_data or {}).get("content", "")
+            if not content:
+                break
+            parts.append(content)
+            offset += self._READ_PAGE_LINES
+        return "".join(parts).encode("utf-8")
 
     def path_read_text(self, path: PurePosixPath) -> str:
         return self.path_read_bytes(path).decode("utf-8")
