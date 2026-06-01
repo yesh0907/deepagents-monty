@@ -17,7 +17,7 @@ Usage::
 from .bridge import DeepAgentBackendOS
 from .middleware import MontyCodeMiddleware, make_execute_python
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "DeepAgentBackendOS",
