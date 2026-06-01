@@ -156,6 +156,41 @@ Function signatures are inferred from Python annotations and added to Monty's
 type checker. Pass `type_check_stubs` when the public sandbox contract should be
 more precise than the host function signature.
 
+## Customizing the system prompt
+
+`MontyCodeMiddleware` injects a default system prompt (the public
+`MONTY_SYSTEM_PROMPT`) that describes `python_repl`'s mechanics and limitations
+to the model. There are two ways to customize it:
+
+- `append_system_prompt` — **add** guidance after the default prompt. Use this
+  when you want the built-in mechanics doc plus your own instructions (e.g. when
+  to reach for `python_repl`):
+
+  ```python
+  from deepagents_monty import MontyCodeMiddleware
+
+  middleware = MontyCodeMiddleware(
+      backend=backend,
+      append_system_prompt=(
+          "Reach for python_repl whenever a task involves loops, aggregation, "
+          "or parsing JSON across many files — it is cheaper than a long chain "
+          "of read_file calls."
+      ),
+  )
+  ```
+
+- `system_prompt` — **replace** the default prompt entirely. You lose the
+  built-in mechanics/limitations doc, so only do this if you intend to describe
+  the tool yourself.
+
+The two compose independently: pass both to replace the base *and* append to it.
+The default prompt is exported as `MONTY_SYSTEM_PROMPT` if you want to
+introspect or compose against it:
+
+```python
+from deepagents_monty import MONTY_SYSTEM_PROMPT
+```
+
 ## API
 
 ```python
@@ -163,6 +198,7 @@ MontyCodeMiddleware(
     *,
     backend,
     system_prompt=None,
+    append_system_prompt=None,
     external_functions=None,
     type_check_stubs=None,
     max_duration_secs=10.0,
@@ -172,8 +208,14 @@ MontyCodeMiddleware(
 
 - `backend`: required Deep Agents backend. Pass the same backend you pass to
   `create_deep_agent(backend=...)`.
-- `system_prompt`: optional replacement for the default prompt that describes
-  `python_repl` to the model.
+- `system_prompt`: optional **replacement** for the default prompt that describes
+  `python_repl` to the model. Using this drops the built-in mechanics and
+  limitations doc — prefer `append_system_prompt` when you just want to add
+  guidance.
+- `append_system_prompt`: optional extra guidance appended after the base prompt
+  (separated by a blank line). The base is `system_prompt` if provided, else the
+  default. Composes independently of `system_prompt`. See
+  [Customizing the system prompt](#customizing-the-system-prompt).
 - `external_functions`: optional host functions exposed as global names inside
   Monty code.
 - `type_check_stubs`: optional Python stub text for external functions and
