@@ -1,6 +1,6 @@
 [project]
 name = "deepagents-monty"
-version = "0.1.0"
+version = "0.1.1"
 description = "Monty-backed Python REPL middleware for Deep Agents, with a shared filesystem between the sandbox and the agent's file tools."
 readme = "README.md"
 requires-python = ">=3.11"

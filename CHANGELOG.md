@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-30
+
+### Fixed
+
+- `DeepAgentBackendOS.path_read_bytes` / `path_read_text` no longer truncate
+  large files. The backend's `read` defaults to `limit=2000` LINES (a display
+  cap for the agent's `read_file` tool); that cap was leaking into `pathlib`
+  reads inside the Monty sandbox, so `Path(p).read_text()` returned only the
+  first 2000 lines. Large offloaded tool results (e.g. a ~300-row indented JSON
+  array) were silently cut off, breaking `json.loads`. Reads now paginate by
+  line offset and concatenate every window, returning the whole file. Binary
+  (base64) reads are unaffected — backends return those whole regardless of the
+  line cap.
+
 ## [0.1.0] - 2026-05-28
 
 ### Added
