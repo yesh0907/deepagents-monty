@@ -47,11 +47,20 @@ you choose to expose.
 
 ## Resource Limits
 
-`max_duration_secs` controls the per-call wall-clock limit for sandboxed code:
+`max_duration_secs` controls cumulative interpreter execution time for the
+checked-out session. Time spent suspended on host callbacks does not count.
+`request_timeout_secs` is a separate host-side backstop that terminates and
+replaces a worker that hangs during an operation:
 
 ```python
-MontyCodeMiddleware(backend=backend, max_duration_secs=5.0)
+MontyCodeMiddleware(
+    backend=backend,
+    max_duration_secs=5.0,
+    request_timeout_secs=8.0,
+)
 ```
 
 Use a lower value for latency-sensitive agents and a higher value for workflows
-that intentionally process larger virtual files.
+that intentionally process larger virtual files. Pydantic Monty 0.0.19 runs
+the interpreter in subprocess workers, so a sandbox crash raises a model-visible
+error without crashing the agent host.

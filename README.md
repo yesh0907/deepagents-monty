@@ -98,8 +98,8 @@ values simple, and expose only the operations the model should be allowed to use
 
 `deepagents-monty` inherits Monty's current Python subset:
 
-- no class definitions
-- no match statements, generators, or context managers
+- partial classes and synchronous context managers, but no inheritance,
+  metaclasses, generators, `async with`, or match statements
 - no third-party libraries such as `pandas`, `requests`, or `numpy`
 - only a small standard-library subset
 - no wall-clock or timing primitives
@@ -202,6 +202,7 @@ MontyCodeMiddleware(
     external_functions=None,
     type_check_stubs=None,
     max_duration_secs=10.0,
+    request_timeout_secs=15.0,
     type_check=True,
 )
 ```
@@ -220,7 +221,10 @@ MontyCodeMiddleware(
   Monty code.
 - `type_check_stubs`: optional Python stub text for external functions and
   model-facing types.
-- `max_duration_secs`: per-call wall-clock cap for sandbox execution.
+- `max_duration_secs`: cumulative sandbox execution-time cap for a checked-out
+  session. Time spent awaiting host functions is excluded.
+- `request_timeout_secs`: host-side per-operation timeout. A worker that
+  exceeds it is terminated and replaced; use `None` to disable it.
 - `type_check`: enables Monty's parse-time type checker. Defaults to `True`.
 
 Advanced users can also build the standalone `python_repl` tool with

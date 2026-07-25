@@ -30,7 +30,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "pydantic-monty>=0.0.17",
+    "pydantic-monty>=0.0.19",
     "deepagents>=0.5.3",
     "langchain>=1.0.0",
     "langchain-core>=1.0.0",

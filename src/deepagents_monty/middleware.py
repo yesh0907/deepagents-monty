@@ -29,7 +29,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.prebuilt.tool_node import ToolRuntime
 from langgraph.types import Command
 from pydantic import Field
-from pydantic_monty import MontyRepl, ResourceLimits
+from pydantic_monty import AsyncMonty, AsyncMontySession, ResourceLimits
 from typing_extensions import TypedDict
 
 from .bridge import DeepAgentBackendOS
@@ -58,11 +58,13 @@ State is preserved between calls (REPL-style). Set restart=true to reset
 the REPL state before running the snippet.
 
 Limitations:
-- Subset of Python only: no classes, no match statements, no generators,
-  no context managers (yet).
+- Subset of Python only: classes and synchronous context managers have partial
+  support, but there is no inheritance, metaclasses, generators, async context
+  managers, or match statements.
 - No third-party libraries (pandas, requests, etc.).
 - Importable standard library modules: sys, typing, asyncio, math, json, re,
-  datetime, os, pathlib. Import them at the top of your snippet before use.
+  datetime, os, pathlib, unicodedata. Import them at the top of your snippet
+  before use.
 - No wall-clock or timing primitives: asyncio.sleep, datetime.datetime.now(),
   datetime.date.today(), and the time module are unavailable.
 - No import * wildcard imports.
@@ -92,12 +94,13 @@ through `pathlib.Path`, and sees the SAME filesystem as `ls`, `read_file`, \
 (start with `/`).
 
 Limitations to be aware of:
-- This is a Python subset: no class definitions, no match statements, no \
-context managers (yet).
+- This is a Python subset: classes and synchronous context managers have \
+partial support, but there is no inheritance, metaclasses, generators, async \
+context managers, or match statements.
 - No third-party libraries (pandas, requests, numpy, etc.). Only core \
 syntax and a small stdlib subset (`sys`, `typing`, `asyncio`, `math`, \
-`json`, `re`, `datetime`, `os`, `pathlib`). Import modules at the top of \
-your snippet before use.
+`json`, `re`, `datetime`, `os`, `pathlib`, `unicodedata`). Import modules at \
+the top of your snippet before use.
 - No wall-clock or timing primitives: `asyncio.sleep`, \
 `datetime.datetime.now()`, `datetime.date.today()`, and the `time` module \
 are unavailable.
@@ -162,6 +165,7 @@ def make_execute_python(
     external_functions: dict[str, Callable[..., Any]] | None = None,
     type_check_stubs: str | None = None,
     max_duration_secs: float = 10.0,
+    request_timeout_secs: float | None = 15.0,
     type_check: bool = True,
 ) -> StructuredTool:
     """Build a standalone ``python_repl`` tool.
@@ -199,40 +203,43 @@ def make_execute_python(
             stdout_chunks.append(text)
 
         try:
-            repl = _load_repl(
-                runtime,
-                limits=ResourceLimits(max_duration_secs=max_duration_secs),
-                type_check=type_check,
-                type_check_stubs=effective_type_check_stubs,
-                restart=restart,
-            )
-        except pm.MontySyntaxError as e:
-            return f"SyntaxError: {e}"
-        except pm.MontyTypingError as e:
-            return f"TypeError: {e}"
+            async with AsyncMonty(request_timeout=request_timeout_secs) as pool:
+                async with pool.checkout(
+                    limits=ResourceLimits(max_duration_secs=max_duration_secs),
+                    type_check=type_check,
+                    type_check_stubs=effective_type_check_stubs,
+                ) as session:
+                    await _restore_session(session, runtime, restart=restart)
+                    try:
+                        result = await session.feed_run(
+                            code,
+                            os=fs,
+                            external_lookup=wrapped_external_functions,
+                            print_callback=capture_print,
+                        )
+                        content = _format_result(result, stdout_chunks)
+                    except pm.MontyRuntimeError as e:
+                        stdout = "".join(stdout_chunks)
+                        tail = f"\n--stdout--\n{stdout}" if stdout else ""
+                        content = f"RuntimeError: {e}{tail}"
+                    except pm.MontySyntaxError as e:
+                        content = f"SyntaxError: {e}"
+                    except pm.MontyTypingError as e:
+                        content = f"TypeError: {e}"
+                    except pm.MontyConversionError as e:
+                        content = f"ConversionError: {e}"
+
+                    return await _tool_result(content, session, runtime)
+        except pm.MontyCrashedError as e:
+            if e.timed_out:
+                return f"TimeoutError: Monty worker exceeded the request timeout: {e}"
+            return f"RuntimeError: Monty worker crashed: {e}"
+        except pm.MontyConversionError as e:
+            return f"ConversionError: {e}"
         except (ValueError, TypeError) as e:
             return f"MontyError: {type(e).__name__}: {e}"
-
-        try:
-            result = await repl.feed_run_async(
-                code,
-                os=fs,
-                external_functions=wrapped_external_functions,
-                print_callback=capture_print,
-            )
-            content = _format_result(result, stdout_chunks)
-        except pm.MontyRuntimeError as e:
-            stdout = "".join(stdout_chunks)
-            tail = f"\n--stdout--\n{stdout}" if stdout else ""
-            content = f"RuntimeError: {e}{tail}"
-        except pm.MontySyntaxError as e:
-            content = f"SyntaxError: {e}"
-        except pm.MontyTypingError as e:
-            content = f"TypeError: {e}"
         except pm.MontyError as e:
-            content = f"MontyError: {type(e).__name__}: {e}"
-
-        return _tool_result(content, repl, runtime)
+            return f"MontyError: {type(e).__name__}: {e}"
 
     return StructuredTool.from_function(
         coroutine=execute_python,
@@ -241,19 +248,15 @@ def make_execute_python(
     )
 
 
-def _load_repl(
+async def _restore_session(
+    session: AsyncMontySession,
     runtime: ToolRuntime | None,
     *,
-    limits: ResourceLimits,
-    type_check: bool,
-    type_check_stubs: str | None,
     restart: bool,
-) -> MontyRepl:
+) -> None:
     state_b64 = None if restart else _get_repl_state_b64(runtime)
     if state_b64 is not None:
-        return MontyRepl.load(base64.b64decode(state_b64.encode("ascii")))
-
-    return MontyRepl(limits=limits, type_check=type_check, type_check_stubs=type_check_stubs)
+        await session.load_session(base64.b64decode(state_b64.encode("ascii")))
 
 
 def _get_repl_state_b64(runtime: ToolRuntime | None) -> str | None:
@@ -272,12 +275,16 @@ def _format_result(result: Any, stdout_chunks: list[str]) -> str:
     return "\n".join(parts)
 
 
-def _tool_result(content: str, repl: MontyRepl, runtime: ToolRuntime | None) -> str | Command:
+async def _tool_result(
+    content: str,
+    session: AsyncMontySession,
+    runtime: ToolRuntime | None,
+) -> str | Command:
     tool_call_id = getattr(runtime, "tool_call_id", None)
     if not tool_call_id:
         return content
 
-    state_b64 = base64.b64encode(repl.dump()).decode("ascii")
+    state_b64 = base64.b64encode(await session.dump()).decode("ascii")
     return Command(
         update={
             "messages": [ToolMessage(content=content, tool_call_id=tool_call_id)],
@@ -345,6 +352,7 @@ class MontyCodeMiddleware(AgentMiddleware):
         external_functions: dict[str, Callable[..., Any]] | None = None,
         type_check_stubs: str | None = None,
         max_duration_secs: float = 10.0,
+        request_timeout_secs: float | None = 15.0,
         type_check: bool = True,
     ):
         """Initialize the middleware.
@@ -389,7 +397,10 @@ class MontyCodeMiddleware(AgentMiddleware):
                 (``str``, ``int``, ``float``, ``bool``, ``None``, ``list``,
                 ``dict``) for the most stable model-facing API; richer values
                 may work when supported by Monty and accurately described here.
-            max_duration_secs: Per-call wallclock cap for sandboxed code.
+            max_duration_secs: Cumulative sandbox execution-time cap for one
+                checked-out session.
+            request_timeout_secs: Host-side per-operation timeout. A worker
+                exceeding it is terminated and replaced. Set to None to disable.
             type_check: Whether Monty should run its built-in static type
                 checker (using ``ty``) at parse time. Adds 15-30ms at
                 parse, zero at runtime, and gives the model a clear
@@ -421,6 +432,7 @@ class MontyCodeMiddleware(AgentMiddleware):
                 external_functions=external_functions,
                 type_check_stubs=effective_type_check_stubs,
                 max_duration_secs=max_duration_secs,
+                request_timeout_secs=request_timeout_secs,
                 type_check=type_check,
             )
         ]

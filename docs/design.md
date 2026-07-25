@@ -39,7 +39,18 @@ MontyCodeMiddleware(backend=backend, type_check=False)
 ## REPL State
 
 `python_repl` preserves variables, imports, and function definitions between
-calls. Passing `restart=True` starts a fresh REPL before executing the snippet.
+calls. With Pydantic Monty 0.0.19, each invocation checks out an isolated
+subprocess session, restores the prior idle-session dump from LangGraph state,
+executes the snippet, and stores a fresh dump. Passing `restart=True` skips the
+restore and starts from a fresh session.
+
+## Worker Lifecycle
+
+Pydantic Monty 0.0.19 executes code in subprocess workers. The middleware opens
+an `AsyncMonty` pool for the tool invocation and checks out one session. A
+worker crash or host-side request timeout does not terminate the agent process;
+the error is returned to the model and the last good persisted session dump is
+left intact.
 
 ## Parallel Tool Calls
 
@@ -76,8 +87,8 @@ Monty intentionally separates two host-callback channels:
 
 | Channel | Sync support | Async support | Mechanism |
 | --- | --- | --- | --- |
-| `AbstractOS` | yes | no | direct callback from the worker thread |
-| `external_functions` | yes | yes | suspend/resume through Monty's async runtime |
+| `AbstractOS` | yes | no | subprocess request serviced by a host callback |
+| `external_functions` | yes | yes | exposed through Monty's `external_lookup` |
 
 If you build an async-only backend, expose it through `external_functions`
 instead of trying to drive it through `AbstractOS`:
@@ -103,14 +114,12 @@ middleware = MontyCodeMiddleware(
 The model-facing ergonomics become `await read_file("/x")` instead of
 `Path("/x").read_text()`, but async host operations work natively.
 
-## Threading
+## Callback Context
 
-Monty's VM calls `path_*` methods from a worker thread. LangGraph's
-`StateBackend` reads state through `langgraph.config.get_config()`, which is a
-`ContextVar` lookup. `ContextVar` values are thread-local, so the worker thread
-cannot see the graph config by default.
+Monty's VM runs in a subprocess and sends `path_*` operations back to host-side
+callbacks. LangGraph's `StateBackend` reads state through
+`langgraph.config.get_config()`, which is a `ContextVar` lookup.
 
 `DeepAgentBackendOS.__init__` calls `contextvars.copy_context()` and runs every
 backend call inside that captured context. The backend sees the right
-`CONFIG_KEY_READ` and `CONFIG_KEY_SEND` even when Monty calls from its worker
-thread.
+`CONFIG_KEY_READ` and `CONFIG_KEY_SEND` during callback dispatch.

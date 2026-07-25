@@ -90,6 +90,55 @@ async def test_type_check_can_be_disabled():
     assert "return:" in result, f"expected the expression to evaluate, got: {result}"
 
 
+async def test_request_timeout_is_model_visible():
+    mw = MontyCodeMiddleware(
+        backend=StateBackend(),
+        max_duration_secs=100,
+        request_timeout_secs=0.1,
+        type_check=False,
+    )
+    tool = cast(StructuredTool, mw.tools[0])
+    assert tool.coroutine is not None
+
+    result = await tool.coroutine(code="while True:\n    pass", runtime=None)
+
+    assert result.startswith("TimeoutError: Monty worker exceeded the request timeout")
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        (
+            "class Box:\n    def __init__(self, value):\n        self.value = value\nBox(42).value",
+            "return: 42",
+        ),
+        (
+            "class Manager:\n"
+            "    def __enter__(self):\n"
+            "        return 42\n"
+            "    def __exit__(self, exc_type, exc, tb):\n"
+            "        return False\n"
+            "with Manager() as value:\n"
+            "    result = value\n"
+            "result",
+            "return: 42",
+        ),
+        (
+            "import unicodedata\nunicodedata.normalize('NFC', 'e\\u0301')",
+            "return: 'é'",
+        ),
+    ],
+)
+async def test_monty_0_0_19_advertised_capabilities_execute(code: str, expected: str):
+    mw = MontyCodeMiddleware(backend=StateBackend(), type_check=False)
+    tool = cast(StructuredTool, mw.tools[0])
+    assert tool.coroutine is not None
+
+    result = await tool.coroutine(code=code, runtime=None)
+
+    assert result == expected
+
+
 async def test_python_repl_rejects_parallel_tool_call_batch():
     mw = MontyCodeMiddleware(backend=StateBackend())
     tool = cast(StructuredTool, mw.tools[0])
@@ -338,6 +387,12 @@ def test_monty_system_prompt_is_importable_and_matches_default():
     text = _capture_injected_prompt(mw)
     # With no external functions, the injected prompt is exactly the default base.
     assert MONTY_SYSTEM_PROMPT in text
+
+
+def test_default_prompt_describes_monty_0_0_19_capabilities():
+    assert "classes and synchronous context managers have partial support" in MONTY_SYSTEM_PROMPT
+    assert "no inheritance" in MONTY_SYSTEM_PROMPT
+    assert "unicodedata" in MONTY_SYSTEM_PROMPT
 
 
 def test_append_system_prompt_appends_to_default():

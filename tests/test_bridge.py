@@ -18,7 +18,7 @@ from deepagents.backends.protocol import (
     ReadResult,
     WriteResult,
 )
-from pydantic_monty import Monty
+from pydantic_monty import Monty, MontyFileHandle
 
 from deepagents_monty import DeepAgentBackendOS
 
@@ -102,13 +102,29 @@ def seeded_bridge() -> tuple[DeepAgentBackendOS, InMemoryBackend]:
     return DeepAgentBackendOS(cast(BackendProtocol, backend)), backend
 
 
+def _run_monty(code: str, bridge: DeepAgentBackendOS):
+    with Monty() as pool:
+        with pool.checkout() as session:
+            return session.feed_run(code, os=bridge)
+
+
 def test_monty_reads_backend_seeded_file(seeded_bridge):
     bridge, _ = seeded_bridge
     code = """
 from pathlib import Path
 Path('/seed.txt').read_text()
 """
-    assert Monty(code).run(os=bridge) == "hello from backend"
+    assert _run_monty(code, bridge) == "hello from backend"
+
+
+def test_bridge_accepts_monty_file_handles(seeded_bridge):
+    bridge, backend = seeded_bridge
+    read_handle = MontyFileHandle("/seed.txt", "r")
+    write_handle = MontyFileHandle("/handle.txt", "w")
+
+    assert bridge.path_read_text(read_handle) == "hello from backend"
+    assert bridge.path_write_text(write_handle, "written through handle") == 22
+    assert backend.files["/handle.txt"]["content"] == "written through handle"
 
 
 def test_monty_write_visible_to_backend(seeded_bridge):
@@ -118,22 +134,24 @@ from pathlib import Path
 Path('/from_monty.txt').write_text('written by monty')
 Path('/from_monty.txt').read_text()
 """
-    result = Monty(code).run(os=bridge)
+    result = _run_monty(code, bridge)
     assert result == "written by monty"
     assert backend.files["/from_monty.txt"]["content"] == "written by monty"
 
 
 def test_monty_overwrite_via_edit_fallback(seeded_bridge):
     bridge, _ = seeded_bridge
-    first = Monty(
-        "from pathlib import Path\nPath('/x.txt').write_text('first')\nPath('/x.txt').read_text()"
-    ).run(os=bridge)
+    first = _run_monty(
+        "from pathlib import Path\nPath('/x.txt').write_text('first')\nPath('/x.txt').read_text()",
+        bridge,
+    )
     assert first == "first"
 
     # Second write overwrites; triggers the edit-fallback path
-    second = Monty(
-        "from pathlib import Path\nPath('/x.txt').write_text('second')\nPath('/x.txt').read_text()"
-    ).run(os=bridge)
+    second = _run_monty(
+        "from pathlib import Path\nPath('/x.txt').write_text('second')\nPath('/x.txt').read_text()",
+        bridge,
+    )
     assert second == "second"
 
 
@@ -148,7 +166,7 @@ except PermissionError as e:
     msg = str(e)[:60]
 msg
 """
-    result = Monty(code).run(os=bridge)
+    result = _run_monty(code, bridge)
     assert "Delete not supported" in result
 
 
@@ -161,7 +179,7 @@ def test_iterdir_sees_synthesized_directory(seeded_bridge):
 from pathlib import Path
 sorted(str(p) for p in Path('/dir1').iterdir())
 """
-    assert Monty(code).run(os=bridge) == ["/dir1/a.txt", "/dir1/b.txt"]
+    assert _run_monty(code, bridge) == ["/dir1/a.txt", "/dir1/b.txt"]
 
 
 def test_rename_blocked(seeded_bridge):
@@ -175,7 +193,7 @@ except PermissionError as e:
     out = 'blocked: ' + str(e)[:40]
 out
 """
-    assert Monty(code).run(os=bridge).startswith("blocked:")
+    assert _run_monty(code, bridge).startswith("blocked:")
 
 
 def test_read_large_file_is_not_truncated_at_default_line_limit(seeded_bridge):
@@ -215,4 +233,4 @@ from pathlib import Path
 data = json.loads(Path('/big.json').read_text())
 len(data)
 """
-    assert Monty(code).run(os=bridge) == n_rows
+    assert _run_monty(code, bridge) == n_rows

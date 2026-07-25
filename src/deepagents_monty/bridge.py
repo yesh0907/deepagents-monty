@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from deepagents.backends.protocol import BackendProtocol
-from pydantic_monty import AbstractOS, StatResult
+from pydantic_monty import AbstractOS, MontyFileHandle, StatResult
 
 
 class DeepAgentBackendOS(AbstractOS):
@@ -21,14 +21,14 @@ class DeepAgentBackendOS(AbstractOS):
     into the backend (state, store, etc). Writes inside Monty become state
     updates visible to every other tool using the same backend.
 
-    Threading note
-    --------------
-    Monty's VM calls these ``path_*`` methods from a worker thread, not the
-    caller's async thread. LangGraph's ``StateBackend`` looks up state via a
-    ``ContextVar`` that's only set on the caller's thread. We capture the
-    current ``contextvars.Context`` at construction time and replay every
-    backend call inside that context, so ``StateBackend`` sees the right
-    LangGraph config (``CONFIG_KEY_READ`` / ``CONFIG_KEY_SEND``).
+    Callback context
+    ----------------
+    Monty 0.0.19 runs the VM in a subprocess and dispatches ``path_*`` calls
+    back to this host-side object. LangGraph's ``StateBackend`` looks up state
+    through ``ContextVar`` values. We capture the current context at
+    construction time and replay every backend call inside it, so callback
+    dispatch continues to see the right LangGraph config
+    (``CONFIG_KEY_READ`` / ``CONFIG_KEY_SEND``).
 
     Sync-only by design
     -------------------
@@ -39,8 +39,8 @@ class DeepAgentBackendOS(AbstractOS):
     Monty intentionally separates two host-callback channels:
 
     1. ``AbstractOS`` (what we use here) — synchronous, for OS-level
-       operations (``pathlib``, ``os``, ``datetime``). Called directly from
-       Monty's worker thread. Fast, no suspension.
+       operations (``pathlib``, ``os``, ``datetime``). The subprocess suspends
+       while the host services the callback.
 
     2. ``external_functions`` — natively supports async coroutine functions
        via Monty's suspend/resume model. The VM pauses at each external
@@ -48,14 +48,8 @@ class DeepAgentBackendOS(AbstractOS):
        resumed once the result is ready.
 
     If you need to front a genuinely async-only backend (e.g. a remote
-    S3/Postgres-style service with no sync API), do **not** try to drive
-    it through ``AbstractOS``. Attempting to bridge back to an asyncio
-    loop from Monty's worker thread deadlocks: Monty's PyO3 Future pins
-    the main Python thread while awaiting its worker, so a coroutine
-    scheduled on the main loop via ``run_coroutine_threadsafe`` never
-    runs. A dedicated-loop-thread workaround exists but pays a ~3-4s
-    first-call PyO3/tokio warmup cost, and it's not the canonical
-    Monty pattern.
+    S3/Postgres-style service with no sync API), do **not** try to drive it
+    through the synchronous ``AbstractOS`` contract.
 
     The idiomatic alternative is to expose those host operations through
     ``MontyCodeMiddleware(external_functions=...)``::
@@ -73,14 +67,18 @@ class DeepAgentBackendOS(AbstractOS):
 
     def __init__(self, backend: BackendProtocol):
         self._b = backend
-        # Snapshot contextvars so backend calls from Monty's worker thread
-        # still see the graph's config (CONFIG_KEY_READ / SEND).
+        # Snapshot contextvars so host-side callback dispatch still sees the
+        # graph's config (CONFIG_KEY_READ / SEND).
         self._ctx = contextvars.copy_context()
 
     def _call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke a sync backend method inside the captured LangGraph context."""
         sync_fn = getattr(self._b, method_name)
         return self._ctx.run(sync_fn, *args, **kwargs)
+
+    @staticmethod
+    def _path_str(path: PurePosixPath | MontyFileHandle) -> str:
+        return path.path if isinstance(path, MontyFileHandle) else str(path)
 
     # ---- environment / path normalization (no-op for our purposes) -----
 
@@ -124,7 +122,7 @@ class DeepAgentBackendOS(AbstractOS):
     # windows and concatenate until a short page signals EOF.
     _READ_PAGE_LINES = 5000
 
-    def path_read_bytes(self, path: PurePosixPath) -> bytes:
+    def path_read_bytes(self, path: PurePosixPath | MontyFileHandle) -> bytes:
         # ``backend.read`` defaults to ``limit=2000`` LINES — a display cap for
         # the agent's ``read_file`` tool. That default must NOT leak into
         # ``pathlib`` reads, where ``Path(p).read_text()`` must return the
@@ -133,9 +131,10 @@ class DeepAgentBackendOS(AbstractOS):
         #
         # Slices preserve each line's terminator (``splitlines(keepends=True)``
         # joined with ``""``), so adjacent windows reconstruct the file exactly.
-        first = self._call("read", str(path), offset=0, limit=self._READ_PAGE_LINES)
+        path_str = self._path_str(path)
+        first = self._call("read", path_str, offset=0, limit=self._READ_PAGE_LINES)
         if first.error:
-            raise FileNotFoundError(str(path))
+            raise FileNotFoundError(path_str)
         fd = first.file_data or {}
         encoding = fd.get("encoding", "utf-8")
 
@@ -152,7 +151,7 @@ class DeepAgentBackendOS(AbstractOS):
         # CRLF→LF normalization can't desync the EOF check.
         offset = self._READ_PAGE_LINES
         while len(content.splitlines(keepends=True)) >= self._READ_PAGE_LINES:
-            page = self._call("read", str(path), offset=offset, limit=self._READ_PAGE_LINES)
+            page = self._call("read", path_str, offset=offset, limit=self._READ_PAGE_LINES)
             if page.error:
                 # Offset past EOF — we've already consumed the whole file.
                 break
@@ -163,7 +162,7 @@ class DeepAgentBackendOS(AbstractOS):
             offset += self._READ_PAGE_LINES
         return "".join(parts).encode("utf-8")
 
-    def path_read_text(self, path: PurePosixPath) -> str:
+    def path_read_text(self, path: PurePosixPath | MontyFileHandle) -> str:
         return self.path_read_bytes(path).decode("utf-8")
 
     def path_iterdir(self, path: PurePosixPath) -> list[PurePosixPath]:
@@ -190,7 +189,7 @@ class DeepAgentBackendOS(AbstractOS):
         elif r.error:
             raise OSError(r.error)
 
-    def path_write_bytes(self, path: PurePosixPath, data: bytes) -> int:
+    def path_write_bytes(self, path: PurePosixPath | MontyFileHandle, data: bytes) -> int:
         # StateBackend.write currently accepts only str. Encode binary via
         # base64; for v0.1 we error loudly so the caller sees the limit.
         try:
@@ -199,11 +198,11 @@ class DeepAgentBackendOS(AbstractOS):
             raise NotImplementedError(
                 "binary writes not yet supported by this bridge (StateBackend.write is str-only)"
             ) from exc
-        self._write_with_overwrite(str(path), text)
+        self._write_with_overwrite(self._path_str(path), text)
         return len(data)
 
-    def path_write_text(self, path: PurePosixPath, data: str) -> int:
-        self._write_with_overwrite(str(path), data)
+    def path_write_text(self, path: PurePosixPath | MontyFileHandle, data: str) -> int:
+        self._write_with_overwrite(self._path_str(path), data)
         return len(data)
 
     # ---- stat ----------------------------------------------------------

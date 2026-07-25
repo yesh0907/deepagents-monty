@@ -197,3 +197,60 @@ async def test_python_repl_restart_resets_state():
     assert tool_results["repl1"] == "return: 41"
     assert tool_results["repl2"].startswith("RuntimeError:")
     assert "counter" in tool_results["repl2"]
+
+
+async def test_worker_timeout_preserves_last_good_repl_state():
+    shared_backend = StateBackend()
+    script: list[BaseMessage] = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "python_repl",
+                    "args": {"code": "counter = 41\ncounter"},
+                    "id": "repl1",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "python_repl",
+                    "args": {"code": "while True:\n    pass"},
+                    "id": "repl2",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "python_repl",
+                    "args": {"code": "counter + 1"},
+                    "id": "repl3",
+                }
+            ],
+        ),
+        AIMessage(content="All done."),
+    ]
+    fake_model = ToolCapableFakeModel(responses=script)
+    agent = create_deep_agent(
+        model=fake_model,
+        middleware=[
+            MontyCodeMiddleware(
+                backend=shared_backend,
+                max_duration_secs=100,
+                request_timeout_secs=0.1,
+                type_check=False,
+            )
+        ],
+        backend=shared_backend,
+    )
+
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": "demo"}]})
+    tool_results = _collect_tool_results(result["messages"])
+
+    assert tool_results["repl1"] == "return: 41"
+    assert tool_results["repl2"].startswith("TimeoutError:")
+    assert tool_results["repl3"] == "return: 42"

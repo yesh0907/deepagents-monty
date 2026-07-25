@@ -5,10 +5,10 @@ constraints from the Deep Agents backend bridge.
 
 Current limitations:
 
-- no class definitions
+- classes are partial: no inheritance or metaclasses
 - no match statements
 - no generators
-- no context managers
+- synchronous context managers are partial; no `async with`
 - no third-party libraries such as `pandas`, `requests`, or `numpy`
 - no wall-clock or timing primitives such as `asyncio.sleep`,
   `datetime.datetime.now()`, `datetime.date.today()`, or the `time` module
@@ -27,6 +27,7 @@ Importable standard-library modules currently include:
 - `datetime`
 - `os`
 - `pathlib`
+- `unicodedata`
 
 ## Filesystem Mutations
 

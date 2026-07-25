@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Require `pydantic-monty>=0.0.19` and migrate execution from the removed
+  `MontyRepl` API to subprocess-backed `AsyncMonty` pools and sessions.
+- Restore and persist REPL state with session dumps, use `external_lookup` for
+  host functions, and adopt dictionary-style resource limits.
+- Add `request_timeout_secs` as a host-side worker timeout and report worker
+  crashes, timeouts, and conversion failures as model-visible errors.
+- Refresh the advertised Python subset for partial classes and context managers
+  plus the new `unicodedata` support.
+
 ## [0.2.0] - 2026-05-30
 
 ### Added
