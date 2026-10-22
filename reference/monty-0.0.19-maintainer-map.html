@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Monty 0.0.19 Maintainer Map</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="eyebrow">Quick reference</p>
+  <h1>Monty 0.0.19 maintainer map</h1>
+  <p class="lede">Upstream change → integration consequence → regression proof.</p>
+
+  <table>
+    <thead><tr><th>Monty 0.0.19</th><th>DeepAgents Monty consequence</th><th>Proof</th></tr></thead>
+    <tbody>
+      <tr><td><code>MontyRepl</code> removed</td><td>Use <code>AsyncMonty</code>, checkout a session</td><td>Middleware execution tests</td></tr>
+      <tr><td>Workers are subprocesses</td><td>Handle crashes/timeouts; preserve last good graph state</td><td>Timeout recovery integration test</td></tr>
+      <tr><td>Idle state via <code>session.dump()</code></td><td>Base64 dump into private LangGraph state; restore with <code>load_session()</code></td><td>Persistence and restart tests</td></tr>
+      <tr><td><code>external_lookup</code></td><td>Map public <code>external_functions</code> to new feed argument</td><td>Sync/async callback tests</td></tr>
+      <tr><td><code>ResourceLimits</code> is a <code>TypedDict</code></td><td>Pass limits at checkout; separate execution time from host timeout</td><td>Typecheck and timeout test</td></tr>
+      <tr><td><code>MontyFileHandle</code> reaches OS callbacks</td><td>Normalize both paths and handles in the filesystem bridge</td><td>File-handle bridge test</td></tr>
+      <tr><td>Expanded Python subset</td><td>Update prompt and limitations without overclaiming</td><td>Execute classes, context manager, <code>unicodedata</code></td></tr>
+    </tbody>
+  </table>
+
+  <div class="checkpoint">
+    <strong>Upgrade heuristic.</strong> Review every release against five seams:
+    lifecycle, persisted state, host callbacks, resource/error boundaries, and
+    model-visible capabilities.
+  </div>
+
+  <p>Primary source: <a href="https://github.com/pydantic/monty/blob/v0.0.19/crates/monty-python/README.md">Pydantic Monty v0.0.19 Python API guide</a>.</p>
+  <p><a href="../lessons/0001-from-repl-to-worker-sessions.html">Return to lesson 0001</a></p>
+</main>
+</body>
+</html>

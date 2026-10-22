@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>From REPL Object to Worker Sessions</title>
+  <style>
+:root {
+  color-scheme: light;
+  --paper: #f7f4ed;
+  --ink: #1d2528;
+  --muted: #5d6869;
+  --line: #d7d0c2;
+  --accent: #0b6b66;
+  --accent-soft: #dcece8;
+  --warn: #9a4e25;
+  --code: #162326;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif;
+  font-size: 18px;
+  line-height: 1.58;
+}
+
+main {
+  width: min(880px, calc(100% - 40px));
+  margin: 0 auto;
+  padding: 64px 0 96px;
+}
+
+h1, h2, h3 {
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  line-height: 1.15;
+  letter-spacing: -0.025em;
+}
+
+h1 { font-size: clamp(2.4rem, 6vw, 4.8rem); margin: 0 0 18px; }
+h2 { margin-top: 52px; font-size: 1.65rem; }
+h3 { margin-top: 30px; font-size: 1.12rem; }
+
+p, li { max-width: 72ch; }
+a { color: var(--accent); text-underline-offset: 3px; }
+
+.eyebrow {
+  color: var(--accent);
+  font: 700 0.78rem/1.2 ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.lede { color: var(--muted); font-size: 1.25rem; max-width: 62ch; }
+
+.card, .checkpoint {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 22px 24px;
+  margin: 24px 0;
+  background: rgba(255,255,255,.45);
+}
+
+.checkpoint { border-left: 5px solid var(--accent); }
+.warning { border-left-color: var(--warn); }
+
+.flow {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin: 28px 0;
+  font: 650 0.86rem/1.35 ui-sans-serif, system-ui, sans-serif;
+  text-align: center;
+}
+
+.flow span {
+  background: var(--accent-soft);
+  border-radius: 10px;
+  padding: 14px 8px;
+  position: relative;
+}
+
+.flow span:not(:last-child)::after {
+  content: "→";
+  position: absolute;
+  right: -10px;
+  color: var(--accent);
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .88em;
+}
+
+pre {
+  overflow-x: auto;
+  padding: 20px;
+  border-radius: 12px;
+  background: var(--code);
+  color: #eef5f2;
+  font-size: .84rem;
+  line-height: 1.5;
+}
+
+details {
+  border-top: 1px solid var(--line);
+  padding: 14px 0;
+}
+
+summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-weight: 700;
+}
+
+table { width: 100%; border-collapse: collapse; margin: 24px 0; }
+th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; }
+th { font: 700 .8rem/1.2 ui-sans-serif, system-ui, sans-serif; text-transform: uppercase; }
+
+footer { margin-top: 64px; color: var(--muted); font-size: .92rem; }
+
+@media (max-width: 680px) {
+  .flow { grid-template-columns: 1fr; text-align: left; }
+  .flow span:not(:last-child)::after { content: "↓"; right: 14px; }
+}
+
+@media print {
+  body { background: white; font-size: 11pt; }
+  main { width: 100%; padding: 0; }
+  a { color: inherit; }
+  .card, .checkpoint { break-inside: avoid; }
+}
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Lesson 0001 · 8 minutes</p>
+  <h1>From REPL object to worker sessions</h1>
+  <p class="lede">The architectural shift in Monty 0.0.19 explains nearly every
+  change required in <code>deepagents-monty</code>.</p>
+
+  <h2>The old mental model</h2>
+  <p>Before 0.0.19, the middleware constructed a <code>MontyRepl</code>. That
+  object combined four responsibilities: interpreter creation, execution,
+  live REPL state, and serialization.</p>
+  <pre><code>repl = MontyRepl(limits=..., type_check=...)
+result = await repl.feed_run_async(code, ...)
+state = repl.dump()</code></pre>
+  <p>The DeepAgents integration could therefore think, “load one REPL object,
+  run it, dump it.”</p>
+
+  <h2>The new mental model</h2>
+  <p>In 0.0.19, <code>MontyRepl</code> disappeared. Execution is owned by a
+  pool of crash-isolated worker subprocesses. A checkout dedicates one worker
+  to a session, and the session owns the evolving interpreter state.</p>
+
+  <div class="flow" aria-label="execution lifecycle">
+    <span>AsyncMonty pool</span>
+    <span>Worker subprocess</span>
+    <span>Checked-out session</span>
+    <span>feed_run</span>
+  </div>
+
+  <pre><code>async with AsyncMonty(request_timeout=15) as pool:
+    async with pool.checkout(limits={...}) as session:
+        await session.load_session(previous_dump)
+        result = await session.feed_run(code, ...)
+        next_dump = await session.dump()</code></pre>
+
+  <div class="card">
+    <strong>The key distinction:</strong> a pool manages worker capacity and
+    failure isolation; a session manages one stateful Python conversation.
+    LangGraph state stores neither object—it stores an opaque dump between
+    tool calls.
+  </div>
+
+  <h2>Why this changed our package</h2>
+
+  <h3>1. Persistence became reconstruction</h3>
+  <p>Each <code>python_repl</code> call now checks out a fresh session, loads
+  the prior idle-session dump, executes, and saves a new dump. The visible
+  behavior—variables persist—stays the same, but the mechanism is different.</p>
+
+  <h3>2. Failure gained a host boundary</h3>
+  <p><code>max_duration_secs</code> limits interpreter execution. The pool's
+  <code>request_timeout</code> is different: it kills a worker that fails to
+  answer the host. If that happens, the middleware must return a useful error
+  without replacing the last known-good LangGraph snapshot.</p>
+
+  <h3>3. Host integration protocols moved</h3>
+  <p>External functions are passed as <code>external_lookup</code>, resource
+  limits are checkout configuration, and filesystem callbacks can receive a
+  <code>MontyFileHandle</code> rather than only a path. These sound small, but
+  each touches a different DeepAgents seam.</p>
+
+  <h2>Maintainer exercise</h2>
+  <div class="checkpoint">
+    <p>Without looking back, predict which owner should handle each concern:</p>
+    <ol>
+      <li>How many worker processes may exist?</li>
+      <li>Whether <code>counter = 41</code> survives the next tool call?</li>
+      <li>What happens when a worker stops responding?</li>
+      <li>Where the opaque state lives between DeepAgents calls?</li>
+    </ol>
+    <details>
+      <summary>Reveal answers</summary>
+      <ol>
+        <li>The <strong>pool</strong>.</li>
+        <li>The <strong>session dump and restore cycle</strong>.</li>
+        <li>The pool's <strong>request timeout and crash handling</strong>.</li>
+        <li><strong>LangGraph state</strong>, Base64-encoding the dump for serialization.</li>
+      </ol>
+    </details>
+  </div>
+
+  <h2>The maintenance habit to keep</h2>
+  <p>For every future Monty release, inspect five seams: lifecycle, persisted
+  state, host callbacks, resource/error boundaries, and model-visible
+  capabilities. The <a href="https://vibebin.yeshc.workers.dev/a/aVMdZg97rg">0.0.19
+  maintainer map</a> turns those seams into a regression checklist.</p>
+
+  <div class="checkpoint warning">
+    <strong>Primary reading:</strong>
+    <a href="https://github.com/pydantic/monty/blob/v0.0.19/crates/monty-python/README.md">the tagged Monty 0.0.19 Python API guide</a>.
+    Focus on “Basic execution,” “Snapshots,” “Resource limits,” and “Crash isolation.”
+  </div>
+
+  <footer>
+    Ask your teaching agent about anything unclear—or explain the pool/session
+    distinction back in your own words so the next lesson can build on evidence,
+    not exposure.
+  </footer>
+</main>
+</body>
+</html>
